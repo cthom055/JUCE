@@ -62,6 +62,7 @@ JUCE_BEGIN_NO_SANITIZE ("vptr")
 #include <juce_gui_basics/native/juce_WindowsHooks_windows.h>
 
 //==============================================================================
+#include <array>
 #include <juce_audio_processors_headless/format_types/juce_LegacyAudioParameter.h>
 #include <juce_audio_processors_headless/utilities/juce_FlagCache.h>
 #include <juce_audio_processors_headless/format_types/juce_VST3Utilities.h>
@@ -2817,6 +2818,8 @@ public:
 
         if (willBeActive)
         {
+            resetTrackedNoteExpressionTargets();
+
             const auto sampleRate = processSetup.sampleRate > 0.0
                                   ? processSetup.sampleRate
                                   : getPluginInstance().getSampleRate();
@@ -2829,6 +2832,7 @@ public:
         }
         else
         {
+            resetTrackedNoteExpressionTargets();
             getPluginInstance().releaseResources();
         }
 
@@ -3594,7 +3598,10 @@ public:
     tresult PLUGIN_API setProcessing (TBool state) override
     {
         if (! state)
+        {
+            resetTrackedNoteExpressionTargets();
             getPluginInstance().reset();
+        }
 
         return kResultTrue;
     }
@@ -3680,6 +3687,117 @@ public:
         }
     }
 
+    struct TrackedNoteExpressionTarget
+    {
+        Steinberg::int32 noteId = -1;
+        int channel = 0;
+    };
+
+    static constexpr size_t maxTrackedNoteExpressionTargets = 128;
+
+    static int createSafeMidiChannel (Steinberg::int16 channel) noexcept
+    {
+        return (int) jlimit (1, 16, channel + 1);
+    }
+
+    void resetTrackedNoteExpressionTargets()
+    {
+        for (auto& target : trackedNoteExpressionTargets)
+            target = {};
+    }
+
+    TrackedNoteExpressionTarget* findTrackedNoteExpressionTarget (Steinberg::int32 noteId)
+    {
+        if (noteId < 0)
+            return nullptr;
+
+        for (auto& target : trackedNoteExpressionTargets)
+            if (target.noteId == noteId)
+                return &target;
+
+        return nullptr;
+    }
+
+    const TrackedNoteExpressionTarget* findTrackedNoteExpressionTarget (Steinberg::int32 noteId) const
+    {
+        if (noteId < 0)
+            return nullptr;
+
+        for (const auto& target : trackedNoteExpressionTargets)
+            if (target.noteId == noteId)
+                return &target;
+
+        return nullptr;
+    }
+
+    void rememberTrackedNoteExpressionTarget (const Vst::Event& event)
+    {
+        if (event.type != Vst::Event::kNoteOnEvent || event.noteOn.noteId < 0)
+            return;
+
+        if (auto* existing = findTrackedNoteExpressionTarget (event.noteOn.noteId))
+        {
+            existing->channel = createSafeMidiChannel (event.noteOn.channel);
+            return;
+        }
+
+        for (auto& target : trackedNoteExpressionTargets)
+        {
+            if (target.noteId >= 0)
+                continue;
+
+            target.noteId = event.noteOn.noteId;
+            target.channel = createSafeMidiChannel (event.noteOn.channel);
+            return;
+        }
+    }
+
+    void forgetTrackedNoteExpressionTarget (const Vst::Event& event)
+    {
+        if (event.type != Vst::Event::kNoteOffEvent || event.noteOff.noteId < 0)
+            return;
+
+        if (auto* existing = findTrackedNoteExpressionTarget (event.noteOff.noteId))
+            *existing = {};
+    }
+
+    void addNoteExpressionToMidiBuffer (const Vst::Event& event)
+    {
+        if (event.type != Vst::Event::kNoteExpressionValueEvent)
+            return;
+
+        // Brightness is the VST3 note-expression dimension that corresponds to MPE slide / CC74.
+        if (event.noteExpressionValue.typeId != Vst::kBrightnessTypeID)
+            return;
+
+        const auto* target = findTrackedNoteExpressionTarget (event.noteExpressionValue.noteId);
+
+        if (target == nullptr)
+            return;
+
+        const auto controllerValue = jlimit (0, 127, roundToInt (event.noteExpressionValue.value * 127.0));
+        midiBuffer.addEvent (MidiMessage::controllerEvent (target->channel, 74, controllerValue), event.sampleOffset);
+    }
+
+    void processInputEvents (Vst::IEventList& eventList)
+    {
+        MidiEventList::toMidiBuffer (midiBuffer, eventList);
+
+        const auto numEvents = eventList.getEventCount();
+
+        for (Steinberg::int32 i = 0; i < numEvents; ++i)
+        {
+            Vst::Event event;
+
+            if (eventList.getEvent (i, event) != Steinberg::kResultOk)
+                continue;
+
+            rememberTrackedNoteExpressionTarget (event);
+            addNoteExpressionToMidiBuffer (event);
+            forgetTrackedNoteExpressionTarget (event);
+        }
+    }
+
     tresult PLUGIN_API process (Vst::ProcessData& data) override
     {
         const FLStudioDIYSpecificationEnforcementLock lock (flStudioDIYSpecificationEnforcementMutex);
@@ -3712,7 +3830,7 @@ public:
 
        #if JucePlugin_WantsMidiInput
         if (isMidiInputBusEnabled && data.inputEvents != nullptr)
-            MidiEventList::toMidiBuffer (midiBuffer, *data.inputEvents);
+            processInputEvents (*data.inputEvents);
        #endif
 
         if (detail::PluginUtilities::getHostType().isWavelab())
@@ -3975,6 +4093,7 @@ private:
 
     MidiBuffer midiBuffer;
     ClientBufferMapper bufferMapper;
+    std::array<TrackedNoteExpressionTarget, maxTrackedNoteExpressionTargets> trackedNoteExpressionTargets {};
 
     bool active = false;
 
