@@ -294,6 +294,13 @@ protected:
                      kVstVersionString)
         {
             infoW.fromAscii (info2);
+
+            // PClassInfoW is the VST3 factory's Unicode representation. The
+            // JUCE plug-in name macro is UTF-8, so decode it before writing the
+            // UTF-16 name instead of widening its individual UTF-8 bytes.
+            const auto unicodeName = juce::String::fromUTF8 (JucePlugin_Name);
+            Steinberg::UString (infoW.name, Steinberg::PClassInfo::kNameSize)
+                .assign (reinterpret_cast<const Steinberg::char16*> (unicodeName.toUTF16().getAddress()));
         }
 
         Steinberg::PClassInfo2 info2;
