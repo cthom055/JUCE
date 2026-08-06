@@ -39,6 +39,66 @@
 namespace juce
 {
 
+[[maybe_unused]] static std::u16string utf8ToUtf16 (const char* text)
+{
+    std::u16string result;
+    auto* current = reinterpret_cast<const unsigned char*> (text);
+
+    while (*current != 0)
+    {
+        uint32_t codePoint = 0xfffd;
+        size_t sequenceLength = 1;
+
+        if (*current < 0x80)
+        {
+            codePoint = *current;
+        }
+        else if ((*current & 0xe0) == 0xc0 && (current[1] & 0xc0) == 0x80)
+        {
+            codePoint = ((uint32_t) (*current & 0x1f) << 6) | (uint32_t) (current[1] & 0x3f);
+            sequenceLength = codePoint >= 0x80 ? 2 : 1;
+        }
+        else if ((*current & 0xf0) == 0xe0
+                 && (current[1] & 0xc0) == 0x80
+                 && (current[2] & 0xc0) == 0x80)
+        {
+            codePoint = ((uint32_t) (*current & 0x0f) << 12)
+                        | ((uint32_t) (current[1] & 0x3f) << 6)
+                        | (uint32_t) (current[2] & 0x3f);
+            sequenceLength = codePoint >= 0x800 && (codePoint < 0xd800 || codePoint > 0xdfff) ? 3 : 1;
+        }
+        else if ((*current & 0xf8) == 0xf0
+                 && (current[1] & 0xc0) == 0x80
+                 && (current[2] & 0xc0) == 0x80
+                 && (current[3] & 0xc0) == 0x80)
+        {
+            codePoint = ((uint32_t) (*current & 0x07) << 18)
+                        | ((uint32_t) (current[1] & 0x3f) << 12)
+                        | ((uint32_t) (current[2] & 0x3f) << 6)
+                        | (uint32_t) (current[3] & 0x3f);
+            sequenceLength = codePoint >= 0x10000 && codePoint <= 0x10ffff ? 4 : 1;
+        }
+
+        current += sequenceLength;
+
+        if (sequenceLength == 1 && codePoint >= 0x80)
+            codePoint = 0xfffd;
+
+        if (codePoint <= 0xffff)
+        {
+            result.push_back ((char16_t) codePoint);
+        }
+        else
+        {
+            codePoint -= 0x10000;
+            result.push_back ((char16_t) (0xd800 + (codePoint >> 10)));
+            result.push_back ((char16_t) (0xdc00 + (codePoint & 0x3ff)));
+        }
+    }
+
+    return result;
+}
+
 [[maybe_unused]] static Steinberg::FUID toSteinbergUID (const VST3Interface::Id& uid)
 {
     return Steinberg::FUID::fromTUID ((const char*) (uid.data()));
@@ -298,9 +358,13 @@ protected:
             // PClassInfoW is the VST3 factory's Unicode representation. The
             // JUCE plug-in name macro is UTF-8, so decode it before writing the
             // UTF-16 name instead of widening its individual UTF-8 bytes.
-            const auto unicodeName = juce::String::fromUTF8 (JucePlugin_Name);
-            Steinberg::UString (infoW.name, Steinberg::PClassInfo::kNameSize)
-                .assign (reinterpret_cast<const Steinberg::char16*> (unicodeName.toUTF16().getAddress()));
+            const auto unicodeName = utf8ToUtf16 (JucePlugin_Name);
+            const auto nameLength = std::min (unicodeName.size(), (size_t) Steinberg::PClassInfo::kNameSize - 1);
+
+            for (size_t i = 0; i < nameLength; ++i)
+                infoW.name[i] = (Steinberg::Vst::TChar) unicodeName[i];
+
+            infoW.name[nameLength] = 0;
         }
 
         Steinberg::PClassInfo2 info2;
