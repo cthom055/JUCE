@@ -267,6 +267,63 @@ public:
             bool acceptsFirstMouse = true;
         };
 
+        /** Options specific to the WebKitGTK backend used on Linux. */
+        class LinuxWebView
+        {
+        public:
+            using DiagnosticLogCallback = std::function<void (const String&)>;
+
+            enum class HardwareAccelerationPolicy
+            {
+                onDemand = 0,
+                always = 1,
+                never = 2
+            };
+
+            enum class RendererProfile
+            {
+                normal,
+                disableDmabuf,
+                disableCompositing
+            };
+
+            [[nodiscard]] LinuxWebView withHardwareAccelerationPolicy (HardwareAccelerationPolicy policy) const
+            {
+                return withMember (*this, &LinuxWebView::hardwareAccelerationPolicy, policy);
+            }
+
+            [[nodiscard]] LinuxWebView withRendererProfile (RendererProfile profile) const
+            {
+                return withMember (*this, &LinuxWebView::rendererProfile, profile);
+            }
+
+            [[nodiscard]] LinuxWebView withDiagnosticsEnabled (bool enabled = true) const
+            {
+                return withMember (*this, &LinuxWebView::diagnosticsEnabled, enabled);
+            }
+
+            /** Receives WebKitGTK helper lifecycle and diagnostic messages in the parent process.
+
+                The callback may be invoked from a background thread. High-volume resource and
+                JavaScript-console messages are only emitted when diagnostics are enabled.
+            */
+            [[nodiscard]] LinuxWebView withDiagnosticLogCallback (DiagnosticLogCallback callback) const
+            {
+                return withMember (*this, &LinuxWebView::diagnosticLogCallback, std::move (callback));
+            }
+
+            auto getHardwareAccelerationPolicy() const noexcept { return hardwareAccelerationPolicy; }
+            auto getRendererProfile() const noexcept             { return rendererProfile; }
+            bool getDiagnosticsEnabled() const noexcept          { return diagnosticsEnabled; }
+            const auto& getDiagnosticLogCallback() const noexcept { return diagnosticLogCallback; }
+
+        private:
+            HardwareAccelerationPolicy hardwareAccelerationPolicy { HardwareAccelerationPolicy::onDemand };
+            RendererProfile rendererProfile { RendererProfile::normal };
+            bool diagnosticsEnabled = false;
+            DiagnosticLogCallback diagnosticLogCallback;
+        };
+
         /** Specifies options that apply to the Windows implementation when the WebView2 feature is
             enabled.
 
@@ -282,6 +339,12 @@ public:
         [[nodiscard]] Options withAppleWkWebViewOptions (const AppleWkWebView& appleWkWebViewOptions) const
         {
             return withMember (*this, &Options::appleWkWebView, appleWkWebViewOptions);
+        }
+
+        /** Specifies options that influence the WebKitGTK backend on Linux. */
+        [[nodiscard]] Options withLinuxWebViewOptions (const LinuxWebView& linuxWebViewOptions) const
+        {
+            return withMember (*this, &Options::linuxWebView, linuxWebViewOptions);
         }
 
         /** Enables native integration features for the code running inside the WebBrowserComponent.
@@ -417,6 +480,7 @@ public:
         auto        getUserAgent() const                                 { return userAgent; }
         auto        getWinWebView2BackendOptions() const                 { return winWebView2; }
         auto        getAppleWkWebViewOptions() const                     { return appleWkWebView; }
+        auto        getLinuxWebViewOptions() const                       { return linuxWebView; }
         auto        getNativeIntegrationsEnabled() const                 { return enableNativeIntegration; }
         const auto& getNativeFunctions() const                           { return nativeFunctions; }
         const auto& getEventListeners() const                            { return eventListeners; }
@@ -434,6 +498,7 @@ public:
         String userAgent;
         WinWebView2 winWebView2;
         AppleWkWebView appleWkWebView;
+        LinuxWebView linuxWebView;
         std::map<Identifier, NativeFunction> nativeFunctions;
         std::vector<std::pair<Identifier, NativeEventListener>> eventListeners;
         StringArray userScripts;

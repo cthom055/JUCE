@@ -33,13 +33,31 @@
 */
 
 #include <dlfcn.h>
+#include <cstdio>
 
 int main (int argc, const char* const* argv)
 {
-    if (argc >= 3)
-        if (auto* handle = dlopen (argv[1], RTLD_LAZY))
-            if (auto* function = reinterpret_cast<int (*) (int, const char* const*)> (dlsym (handle, argv[2])))
-                return function (argc - 3, argv + 3);
+    if (argc < 3)
+    {
+        std::fprintf (stderr, "[JUCE WebView helper] missing plug-in path or entry point\n");
+        return 1;
+    }
 
-    return 1;
+    auto* handle = dlopen (argv[1], RTLD_NOW | RTLD_LOCAL);
+
+    if (handle == nullptr)
+    {
+        std::fprintf (stderr, "[JUCE WebView helper] plug-in dlopen failed: %s\n", dlerror());
+        return 1;
+    }
+
+    dlerror();
+    auto* function = reinterpret_cast<int (*) (int, const char* const*)> (dlsym (handle, argv[2]));
+
+    if (const auto* error = dlerror())
+    {
+        std::fprintf (stderr, "[JUCE WebView helper] dlsym failed: %s\n", error);
+        return 1;
+    }
+    return function (argc - 3, argv + 3);
 }

@@ -37,6 +37,12 @@
 struct WebKitURISchemeResponse;
 #endif
 
+#include <dlfcn.h>
+#include <poll.h>
+#include <array>
+#include <cstring>
+#include <string>
+
 namespace juce
 {
 
@@ -293,6 +299,7 @@ private:
             return true;
         }
 
+        std::cerr << "[JUCE WebView helper] mandatory symbol missing: " << binding.name << std::endl;
         return false;
     }
 
@@ -388,6 +395,7 @@ private:
 
     struct WebKitAndDependencyLibraryNames
     {
+        const char* name;
         const char* webkitLib;
         const char* jsLib;
         const char* soupLib;
@@ -395,8 +403,30 @@ private:
 
     bool openWebKitAndDependencyLibraries (const WebKitAndDependencyLibraryNames& names)
     {
-        if (webkitLib.open (names.webkitLib) && jsLib.open (names.jsLib) && soupLib.open (names.soupLib))
+        std::cerr << "[JUCE WebView helper] trying WebKit tuple " << names.name << std::endl;
+
+        const auto open = [] (DynamicLibrary& library, const char* role, const char* filename)
+        {
+            dlerror();
+            std::cerr << "[JUCE WebView helper] dlopen " << role << ": " << filename << std::endl;
+
+            if (library.open (filename))
+                return true;
+
+            const auto* error = dlerror();
+            std::cerr << "[JUCE WebView helper] dlopen failed for " << filename << ": "
+                      << (error != nullptr ? error : "unknown error") << std::endl;
+            return false;
+        };
+
+        if (open (webkitLib, "WebKit", names.webkitLib)
+            && open (jsLib, "JavaScriptCore", names.jsLib)
+            && open (soupLib, "libsoup", names.soupLib))
+        {
+            selectedTuple = names.name;
+            std::cerr << "[JUCE WebView helper] selected WebKit tuple " << selectedTuple << std::endl;
             return true;
+        }
 
         for (auto* l : { &webkitLib, &jsLib, &soupLib })
             l->close();
@@ -405,22 +435,66 @@ private:
     }
 
     //==============================================================================
-    DynamicLibrary webkitLib, jsLib, soupLib;
+    bool openRuntimeLibrary (DynamicLibrary& library,
+                             const char* role,
+                             std::initializer_list<const char*> filenames)
+    {
+        for (const auto* filename : filenames)
+        {
+            dlerror();
+            std::cerr << "[JUCE WebView helper] dlopen " << role << ": " << filename << std::endl;
 
-    DynamicLibrary gtkLib    { "libgtk-3.so" },
-                   glib      { "libglib-2.0.so" };
+            if (library.open (filename))
+                return true;
 
-    const bool webKitIsAvailable =    (   openWebKitAndDependencyLibraries ({ "libwebkit2gtk-4.1.so",
-                                                                              "libjavascriptcoregtk-4.1.so",
-                                                                              "libsoup-3.0.so" })
-                                       || openWebKitAndDependencyLibraries ({ "libwebkit2gtk-4.0.so",
-                                                                              "libjavascriptcoregtk-4.0.so",
-                                                                              "libsoup-2.4.so" }))
-                                   && loadWebkitSymbols()
-                                   && loadGtkSymbols()
-                                   && loadJsLibSymbols()
-                                   && loadSoupLibSymbols()
-                                   && loadGlibSymbols();
+            const auto* error = dlerror();
+            std::cerr << "[JUCE WebView helper] dlopen failed for " << filename << ": "
+                      << (error != nullptr ? error : "unknown error") << std::endl;
+        }
+
+        return false;
+    }
+
+    bool initialise()
+    {
+        const auto tupleLoaded =
+               openWebKitAndDependencyLibraries ({ "WebKitGTK 4.1 runtime",
+                                                    "libwebkit2gtk-4.1.so.0",
+                                                    "libjavascriptcoregtk-4.1.so.0",
+                                                    "libsoup-3.0.so.0" })
+            || openWebKitAndDependencyLibraries ({ "WebKitGTK 4.0 runtime",
+                                                    "libwebkit2gtk-4.0.so.37",
+                                                    "libjavascriptcoregtk-4.0.so.18",
+                                                    "libsoup-2.4.so.1" })
+            || openWebKitAndDependencyLibraries ({ "WebKitGTK 4.1 development fallback",
+                                                    "libwebkit2gtk-4.1.so",
+                                                    "libjavascriptcoregtk-4.1.so",
+                                                    "libsoup-3.0.so" })
+            || openWebKitAndDependencyLibraries ({ "WebKitGTK 4.0 development fallback",
+                                                    "libwebkit2gtk-4.0.so",
+                                                    "libjavascriptcoregtk-4.0.so",
+                                                    "libsoup-2.4.so" });
+
+        const auto runtimeLoaded = tupleLoaded
+                                && openRuntimeLibrary (gtkLib, "GTK3", { "libgtk-3.so.0", "libgtk-3.so" })
+                                && openRuntimeLibrary (glib, "GLib", { "libglib-2.0.so.0", "libglib-2.0.so" });
+
+        const auto symbolsLoaded = runtimeLoaded
+                                && loadWebkitSymbols()
+                                && loadGtkSymbols()
+                                && loadJsLibSymbols()
+                                && loadSoupLibSymbols()
+                                && loadGlibSymbols();
+
+        if (! symbolsLoaded)
+            std::cerr << "[JUCE WebView helper] mandatory WebKitGTK symbol loading failed" << std::endl;
+
+        return symbolsLoaded;
+    }
+
+    DynamicLibrary webkitLib, jsLib, soupLib, gtkLib, glib;
+    String selectedTuple;
+    const bool webKitIsAvailable = initialise();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WebKitSymbols)
 };
@@ -462,30 +536,66 @@ public:
 
     void tryNextRead (ReturnAfterMessageReceived ret = ReturnAfterMessageReceived::no)
     {
+        std::array<char, 65536> incoming;
+
+        const auto parseAvailableMessages = [&]()
+        {
+            for (;;)
+            {
+                if (buffer.size() < sizeof (size_t))
+                    return false;
+
+                const auto numBytesExpected = readUnaligned<size_t> (buffer.data());
+
+                if (numBytesExpected > maximumMessageSize)
+                {
+                    buffer.clear();
+
+                    if (responder != nullptr)
+                        responder->receiverHadError();
+
+                    return true;
+                }
+
+                const auto framedSize = sizeof (size_t) + numBytesExpected;
+
+                if (buffer.size() < framedSize)
+                    return false;
+
+                const auto* jsonStart = buffer.data() + sizeof (size_t);
+                String json (CharPointer_UTF8 (jsonStart), CharPointer_UTF8 (jsonStart + numBytesExpected));
+                buffer.erase (buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t> (framedSize));
+                parseJSON (json);
+
+                if (ret == ReturnAfterMessageReceived::yes)
+                    return true;
+            }
+        };
+
         for (;;)
         {
-            char lengthBytes[sizeof (size_t)]{};
-            const auto numLengthBytes = readIntoBuffer (lengthBytes);
-
-            if (numLengthBytes != std::size (lengthBytes))
-                break;
-
-            const auto numBytesExpected = readUnaligned<size_t> (lengthBytes);
-            buffer.reserve (numBytesExpected + 1);
-            buffer.resize (numBytesExpected);
-
-            if (readIntoBuffer (buffer) != numBytesExpected)
-                break;
-
-            buffer.push_back (0);
-            parseJSON (StringRef (buffer.data()));
-
-            if (ret == ReturnAfterMessageReceived::yes)
+            if (parseAvailableMessages())
                 return;
-        }
 
-        if (errno != EAGAIN && errno != EWOULDBLOCK && responder != nullptr)
-            responder->receiverHadError();
+            const auto bytesRead = read (inChannel, incoming.data(), incoming.size());
+
+            if (bytesRead > 0)
+            {
+                buffer.insert (buffer.end(), incoming.begin(), incoming.begin() + bytesRead);
+                continue;
+            }
+
+            if (bytesRead < 0 && errno == EINTR)
+                continue;
+
+            if (bytesRead == 0 && responder != nullptr)
+                responder->receiverHadError();
+
+            if (bytesRead < 0 && errno != EAGAIN && errno != EWOULDBLOCK && responder != nullptr)
+                responder->receiverHadError();
+
+            break;
+        }
     }
 
     static void sendCommand (int outChannel, const String& cmd, const var& params)
@@ -499,7 +609,7 @@ public:
 
         auto json = JSON::toString (var (obj.get()));
 
-        auto jsonLength = static_cast<size_t> (json.length());
+        auto jsonLength = static_cast<size_t> (json.getNumBytesAsUTF8());
         auto len        = sizeof (size_t) + jsonLength;
 
         HeapBlock<char> buffer (len);
@@ -510,14 +620,22 @@ public:
 
         memcpy (dst, json.toRawUTF8(), jsonLength);
 
-        ssize_t ret;
+        size_t bytesWritten = 0;
 
-        for (;;)
+        while (bytesWritten < len)
         {
-            ret = write (outChannel, buffer.getData(), len);
+            const auto result = write (outChannel, buffer.getData() + bytesWritten, len - bytesWritten);
 
-            if (ret != -1 || errno != EINTR)
-                break;
+            if (result > 0)
+            {
+                bytesWritten += static_cast<size_t> (result);
+                continue;
+            }
+
+            if (result < 0 && errno == EINTR)
+                continue;
+
+            return;
         }
     }
 
@@ -536,35 +654,11 @@ private:
         }
     }
 
-    /*  Try to fill the target buffer by reading from the input channel.
-        Returns the number of bytes that were successfully read.
-    */
-    size_t readIntoBuffer (Span<char> target) const
-    {
-        size_t pos = 0;
-
-        while (pos != target.size())
-        {
-            const auto bytesThisTime = read (inChannel, target.data() + pos, target.size() - pos);
-
-            if (bytesThisTime <= 0)
-            {
-                if (bytesThisTime != 0 && errno == EINTR)
-                    continue;
-
-                break;
-            }
-
-            pos += static_cast<size_t> (bytesThisTime);
-        }
-
-        return pos;
-    }
-
     static Identifier getCmdIdentifier()    { static Identifier Id ("cmd");    return Id; }
     static Identifier getParamIdentifier()  { static Identifier Id ("params"); return Id; }
 
     std::vector<char> buffer;
+    static constexpr size_t maximumMessageSize = 256 * 1024 * 1024;
     Responder* responder = nullptr;
     int inChannel = 0;
 };
@@ -586,6 +680,9 @@ struct InitialisationData
     String userAgent;
     String userScript;
     String allowedOrigin;
+    int hardwareAccelerationPolicy;
+    int rendererProfile;
+    bool diagnosticsEnabled;
 
     static constexpr std::optional<int> marshallingVersion = std::nullopt;
 
@@ -595,7 +692,10 @@ struct InitialisationData
         archive (named ("nativeIntegrationsEnabled", item.nativeIntegrationsEnabled),
                  named ("userAgent", item.userAgent),
                  named ("userScript", item.userScript),
-                 named ("allowedOrigin", item.allowedOrigin));
+                 named ("allowedOrigin", item.allowedOrigin),
+                 named ("hardwareAccelerationPolicy", item.hardwareAccelerationPolicy),
+                 named ("rendererProfile", item.rendererProfile),
+                 named ("diagnosticsEnabled", item.diagnosticsEnabled));
     }
 };
 
@@ -699,6 +799,8 @@ public:
 
     int entry()
     {
+        std::cerr << "[JUCE WebView helper] child entry pid=" << getpid()
+                  << " parent=" << getppid() << std::endl;
         CommandReceiver::setBlocking (outChannel, true);
 
         {
@@ -717,17 +819,33 @@ public:
 
         auto& wk = *WebKitSymbols::getInstance();
 
+        if (! wk.isWebKitAvailable())
+        {
+            std::cerr << "[JUCE WebView helper] no complete WebKitGTK runtime tuple is available" << std::endl;
+            writeStartupHandle (0);
+            return 1;
+        }
+
         // webkit2gtk crashes when using the wayland backend embedded into an x11 window
+        std::cerr << "[JUCE WebView helper] forcing GTK X11 backend" << std::endl;
         wk.juce_gdk_set_allowed_backends ("x11");
 
+        std::cerr << "[JUCE WebView helper] initialising GTK" << std::endl;
         wk.juce_gtk_init (nullptr, nullptr);
 
         auto* settings = wk.juce_webkit_settings_new();
 
-        static constexpr int webkitHadwareAccelerationPolicyNeverFlag = 2;
+        if (settings == nullptr)
+        {
+            std::cerr << "[JUCE WebView helper] WebKit settings creation failed" << std::endl;
+            writeStartupHandle (0);
+            return 1;
+        }
 
-        WebKitSymbols::getInstance()->juce_webkit_settings_set_hardware_acceleration_policy (settings,
-                                                                                             webkitHadwareAccelerationPolicyNeverFlag);
+        std::cerr << "[JUCE WebView helper] acceleration policy="
+                  << initialisationData->hardwareAccelerationPolicy << std::endl;
+        wk.juce_webkit_settings_set_hardware_acceleration_policy (settings,
+                                                                  initialisationData->hardwareAccelerationPolicy);
         if (initialisationData->userAgent.isNotEmpty())
             WebKitSymbols::getInstance()->juce_webkit_settings_set_user_agent (settings,
                                                                                initialisationData->userAgent.toRawUTF8());
@@ -735,12 +853,24 @@ public:
         auto* plug      = WebKitSymbols::getInstance()->juce_gtk_plug_new (0);
         auto* container = WebKitSymbols::getInstance()->juce_gtk_scrolled_window_new (nullptr, nullptr);
 
-       #if JUCE_DEBUG
-        wk.juce_webkit_settings_set_enable_write_console_messages_to_stdout (settings, true);
-        wk.juce_webkit_settings_set_enable_developer_extras (settings, true);
-       #endif
+        const auto diagnosticsEnabled = initialisationData->diagnosticsEnabled
+                                       #if JUCE_DEBUG
+                                        || true
+                                       #endif
+                                        ;
+
+        wk.juce_webkit_settings_set_enable_write_console_messages_to_stdout (settings, diagnosticsEnabled);
+        wk.juce_webkit_settings_set_enable_developer_extras (settings, diagnosticsEnabled);
 
         auto* webviewWidget = WebKitSymbols::getInstance()->juce_webkit_web_view_new_with_settings (settings);
+
+        if (webviewWidget == nullptr || plug == nullptr || container == nullptr)
+        {
+            std::cerr << "[JUCE WebView helper] GTK/WebKit widget creation failed" << std::endl;
+            writeStartupHandle (0);
+            return 1;
+        }
+
         webview = (WebKitWebView*) webviewWidget;
 
         if (initialisationData->nativeIntegrationsEnabled)
@@ -788,16 +918,8 @@ public:
 
         WebKitSymbols::getInstance()->juce_gtk_widget_show_all (plug);
         auto wID = (unsigned long) WebKitSymbols::getInstance()->juce_gtk_plug_get_id ((GtkPlug*) plug);
-
-        ssize_t ret;
-
-        for (;;)
-        {
-            ret = write (outChannel, &wID, sizeof (wID));
-
-            if (ret != -1 || errno != EINTR)
-                break;
-        }
+        std::cerr << "[JUCE WebView helper] XEmbed socket created handle=" << wID << std::endl;
+        writeStartupHandle (wID);
 
         WebKitSymbols::getInstance()->juce_g_unix_fd_add (receiver.getFd(), G_IO_IN, pipeReadyStatic, this);
         receiver.tryNextRead();
@@ -813,6 +935,8 @@ public:
         auto& wk = *WebKitSymbols::getInstance();
 
         auto s = wk.juce_jsc_value_to_string (wk.juce_webkit_javascript_result_get_js_value (r));
+        if (initialisationData->diagnosticsEnabled)
+            std::cerr << "[JUCE WebView helper] native integration callback" << std::endl;
         CommandReceiver::sendCommand (outChannel, "invokeCallback", var (s));
         wk.juce_g_free (s);
     }
@@ -912,6 +1036,10 @@ public:
         }
 
         auto* request = requestIds.remove (response->requestId);
+
+        if (initialisationData->diagnosticsEnabled)
+            std::cerr << "[JUCE WebView helper] resource response id=" << response->requestId
+                      << (response->resource.has_value() ? " found" : " missing") << std::endl;
 
         // The WebKitURISchemeResponse object will take ownership of the headers
         auto* headers = wk.juce_soup_message_headers_new (SoupMessageHeadersType::SOUP_MESSAGE_HEADERS_RESPONSE);
@@ -1042,6 +1170,10 @@ public:
     {
         if (loadEvent == WEBKIT_LOAD_FINISHED)
         {
+            if (initialisationData->diagnosticsEnabled)
+                std::cerr << "[JUCE WebView helper] page finished: "
+                          << WebKitSymbols::getInstance()->juce_webkit_web_view_get_uri (webview) << std::endl;
+
             DynamicObject::Ptr params = new DynamicObject;
 
             params->setProperty ("url", String (WebKitSymbols::getInstance()->juce_webkit_web_view_get_uri (webview)));
@@ -1092,13 +1224,38 @@ public:
 
     void onLoadFailed (GError* error)
     {
+        const String message (error != nullptr ? error->message : "unknown error");
+        std::cerr << "[JUCE WebView helper] page load failed: " << message << std::endl;
+
         DynamicObject::Ptr params = new DynamicObject;
 
-        params->setProperty ("error", String (error != nullptr ? error->message : "unknown error"));
+        params->setProperty ("error", message);
         CommandReceiver::sendCommand (outChannel, "pageLoadHadNetworkError", var (params.get()));
     }
 
 private:
+    void writeStartupHandle (unsigned long handle) const
+    {
+        const auto* data = reinterpret_cast<const char*> (&handle);
+        size_t written = 0;
+
+        while (written < sizeof (handle))
+        {
+            const auto result = write (outChannel, data + written, sizeof (handle) - written);
+
+            if (result > 0)
+            {
+                written += static_cast<size_t> (result);
+                continue;
+            }
+
+            if (result < 0 && errno == EINTR)
+                continue;
+
+            break;
+        }
+    }
+
     void handleEvaluationCallback (const std::optional<var>& value, const String& error)
     {
         const auto success = value.has_value();
@@ -1115,6 +1272,9 @@ private:
     void handleResourceRequestedCallback (WebKitURISchemeRequest* request, const String& path)
     {
         const auto requestId = requestIds.insert (request);
+        if (initialisationData->diagnosticsEnabled)
+            std::cerr << "[JUCE WebView helper] resource request id=" << requestId
+                      << " path=" << path << std::endl;
         CommandReceiver::sendCommand (outChannel,
                                       ResourceRequest::key,
                                       *ToVar::convert (ResourceRequest { requestId, path }));
@@ -1202,6 +1362,8 @@ private:
 
         if (jsResult == nullptr)
         {
+            std::cerr << "[JUCE WebView helper] JavaScript evaluation failed: "
+                      << (error != nullptr ? error->message : "unknown error") << std::endl;
             owner->handleEvaluationCallback (std::nullopt,
                                              error != nullptr ? String { CharPointer_UTF8 { error->message } }
                                                               : String{});
@@ -1282,13 +1444,20 @@ public:
     Platform (WebBrowserComponent& browserIn,
               const WebBrowserComponent::Options& optionsIn,
               const StringArray& userStrings)
-        : Thread (SystemStats::getJUCEVersion() + ": Webview"), browser (browserIn), userAgent (optionsIn.getUserAgent())
+        : Thread (SystemStats::getJUCEVersion() + ": Webview"),
+          browser (browserIn),
+          userAgent (optionsIn.getUserAgent()),
+          rendererProfile (static_cast<int> (optionsIn.getLinuxWebViewOptions().getRendererProfile())),
+          diagnosticLogCallback (optionsIn.getLinuxWebViewOptions().getDiagnosticLogCallback())
     {
-        webKitIsAvailable = WebKitSymbols::getInstance()->isWebKitAvailable();
+        const auto linuxOptions = optionsIn.getLinuxWebViewOptions();
         init (InitialisationData { optionsIn.getNativeIntegrationsEnabled(),
                                    userAgent,
                                    userStrings.joinIntoString ("\n"),
-                                   optionsIn.getAllowedOrigin() ? *optionsIn.getAllowedOrigin() : "" });
+                                   optionsIn.getAllowedOrigin() ? *optionsIn.getAllowedOrigin() : "",
+                                   static_cast<int> (linuxOptions.getHardwareAccelerationPolicy()),
+                                   rendererProfile,
+                                   linuxOptions.getDiagnosticsEnabled() });
     }
 
     ~Platform() override
@@ -1298,7 +1467,15 @@ public:
 
     void fallbackPaint (Graphics& g) override
     {
-        g.fillAll (Colours::white);
+        g.fillAll (Colour (0xff20242a));
+        g.setColour (Colours::white);
+        g.setFont (FontOptions { 15.0f });
+        g.drawFittedText (startupFailure.isNotEmpty()
+                              ? startupFailure
+                              : "Solstice Linux WebView is starting…",
+                          browser.getLocalBounds().reduced (24),
+                          Justification::centred,
+                          6);
     }
 
     void evaluateJavascript (const String& script, WebBrowserComponent::EvaluationCallback callback) override
@@ -1370,10 +1547,13 @@ public:
     //==============================================================================
     void init (const InitialisationData& initialisationData)
     {
-        if (! webKitIsAvailable)
-            return;
-
         launchChild();
+
+        if (childProcess <= 0)
+        {
+            startupFailure = "Solstice could not start its Linux WebView helper.\nCheck the Solstice log for the exact exec error.";
+            return;
+        }
 
         [[maybe_unused]] auto ret = pipe (threadControl);
 
@@ -1386,31 +1566,109 @@ public:
 
         CommandReceiver::sendCommand (outChannel, "init", *ToVar::convert (initialisationData));
 
-        unsigned long windowHandle;
-        auto actual = read (inChannel, &windowHandle, sizeof (windowHandle));
+        static constexpr int startupTimeoutMs = 10000;
+        std::array<pollfd, 2> startupPoll {{ { inChannel,  POLLIN | POLLHUP | POLLERR, 0 },
+                                             { logChannel, POLLIN | POLLHUP | POLLERR, 0 } }};
+        const auto startupDeadline = Time::getMillisecondCounterHiRes() + startupTimeoutMs;
+        bool startupReady = false;
+        bool startupPollFailed = false;
 
-        if (actual != (ssize_t) sizeof (windowHandle))
+        while (! startupReady)
         {
+            const auto remainingMs = static_cast<int> (startupDeadline - Time::getMillisecondCounterHiRes());
+
+            if (remainingMs <= 0)
+                break;
+
+            int pollResult = 0;
+
+            do
+            {
+                pollResult = poll (startupPoll.data(),
+                                   static_cast<nfds_t> (startupPoll.size()),
+                                   jmin (remainingMs, 250));
+            }
+            while (pollResult < 0 && errno == EINTR);
+
+            if (pollResult < 0)
+            {
+                startupPollFailed = true;
+                break;
+            }
+
+            if ((startupPoll[1].revents & (POLLIN | POLLHUP | POLLERR)) != 0)
+                drainChildLog();
+
+            startupReady = (startupPoll[0].revents & (POLLIN | POLLHUP)) != 0;
+
+            if ((startupPoll[0].revents & POLLERR) != 0)
+                break;
+        }
+
+        if (! startupReady)
+        {
+            startupFailure = ! startupPollFailed
+                               ? "Solstice timed out while starting WebKitGTK.\nThe host remains responsive; see the Solstice log for details."
+                               : "Solstice could not communicate with its WebKitGTK helper.\nSee the Solstice log for details.";
+            writeDiagnostic ("[JUCE WebView parent] helper startup failed or timed out");
             killChild();
+            browser.repaint();
             return;
         }
+
+        unsigned long windowHandle = 0;
+        size_t received = 0;
+
+        while (received < sizeof (windowHandle))
+        {
+            const auto actual = read (inChannel,
+                                      reinterpret_cast<char*> (&windowHandle) + received,
+                                      sizeof (windowHandle) - received);
+
+            if (actual > 0)
+            {
+                received += static_cast<size_t> (actual);
+                continue;
+            }
+
+            if (actual < 0 && errno == EINTR)
+                continue;
+
+            break;
+        }
+
+        if (received != sizeof (windowHandle) || windowHandle == 0)
+        {
+            startupFailure = "Solstice could not initialise WebKitGTK.\nInstall a supported runtime and inspect the Solstice log for the failed library or symbol.";
+            writeDiagnostic ("[JUCE WebView parent] helper returned no XEmbed window");
+            killChild();
+            browser.repaint();
+            return;
+        }
+
+        webKitIsAvailable = true;
 
         receiver.reset (new CommandReceiver (this, inChannel));
 
         pfds.push_back ({ threadControl[0],  POLLIN, 0 });
         pfds.push_back ({ receiver->getFd(), POLLIN, 0 });
+        pfds.push_back ({ logChannel,        POLLIN | POLLHUP | POLLERR, 0 });
 
         startThread();
 
         xembed.reset (new XEmbedComponent (windowHandle));
+        if (! lastBrowserBounds.isEmpty())
+        {
+            writeDiagnostic ("[JUCE WebView parent] sizing XEmbed to "
+                             + String (lastBrowserBounds.getWidth()) + "x"
+                             + String (lastBrowserBounds.getHeight()));
+            xembed->setBounds (lastBrowserBounds);
+        }
         browser.addAndMakeVisible (xembed.get());
     }
 
     void quit()
     {
-        if (! webKitIsAvailable)
-            return;
-
         if (isThreadRunning())
         {
             signalThreadShouldExit();
@@ -1435,6 +1693,8 @@ public:
             CommandReceiver::sendCommand (outChannel, "quit", {});
             killChild();
         }
+
+        closeLogChannel();
     }
 
     //==============================================================================
@@ -1463,8 +1723,15 @@ public:
 
     void resized()
     {
-        if (xembed != nullptr)
-            xembed->setBounds (browser.getLocalBounds());
+        lastBrowserBounds = browser.getLocalBounds();
+
+        if (xembed != nullptr && ! lastBrowserBounds.isEmpty())
+        {
+            writeDiagnostic ("[JUCE WebView parent] sizing XEmbed to "
+                             + String (lastBrowserBounds.getWidth()) + "x"
+                             + String (lastBrowserBounds.getHeight()));
+            xembed->setBounds (lastBrowserBounds);
+        }
     }
 
 private:
@@ -1500,17 +1767,96 @@ private:
 
             childProcess = 0;
         }
+
+        drainChildLog (true);
+    }
+
+    void writeDiagnostic (const String& message) const
+    {
+        if (diagnosticLogCallback != nullptr)
+            diagnosticLogCallback (message);
+        else
+            Logger::writeToLog (message);
+    }
+
+    void drainChildLog (bool flushPartialLine = false)
+    {
+        if (logChannel < 0)
+            return;
+
+        std::array<char, 4096> bytes;
+
+        for (;;)
+        {
+            const auto count = read (logChannel, bytes.data(), bytes.size());
+
+            if (count > 0)
+            {
+                pendingChildLog.append (bytes.data(), static_cast<size_t> (count));
+                continue;
+            }
+
+            if (count < 0 && errno == EINTR)
+                continue;
+
+            break;
+        }
+
+        for (;;)
+        {
+            const auto newline = pendingChildLog.find ('\n');
+
+            if (newline == std::string::npos)
+                break;
+
+            auto line = pendingChildLog.substr (0, newline);
+            pendingChildLog.erase (0, newline + 1);
+
+            if (! line.empty() && line.back() == '\r')
+                line.pop_back();
+
+            if (! line.empty())
+                writeDiagnostic (String::fromUTF8 (line.data(), static_cast<int> (line.size())));
+        }
+
+        if (flushPartialLine && ! pendingChildLog.empty())
+        {
+            writeDiagnostic (String::fromUTF8 (pendingChildLog.data(),
+                                               static_cast<int> (pendingChildLog.size())));
+            pendingChildLog.clear();
+        }
+    }
+
+    void closeLogChannel()
+    {
+        if (logChannel < 0)
+            return;
+
+        drainChildLog (true);
+        close (logChannel);
+        logChannel = -1;
     }
 
     void launchChild()
     {
-        int inPipe[2], outPipe[2];
+        int inPipe[2], outPipe[2], logPipe[2];
 
         [[maybe_unused]] auto ret = pipe (inPipe);
         jassert (ret == 0);
 
         ret = pipe (outPipe);
         jassert (ret == 0);
+
+        ret = pipe (logPipe);
+        if (ret != 0)
+        {
+            writeDiagnostic ("[JUCE WebView parent] diagnostic pipe failed: " + String (std::strerror (errno)));
+            close (inPipe[0]);
+            close (inPipe[1]);
+            close (outPipe[0]);
+            close (outPipe[1]);
+            return;
+        }
 
         std::vector<String> arguments;
 
@@ -1550,21 +1896,63 @@ private:
             return arg.toRawUTF8();
         });
 
+        std::vector<String> environment;
+        const auto preserveEnvironment = [&environment] (const char* name)
+        {
+            if (const auto* value = std::getenv (name); value != nullptr && *value != '\0')
+                environment.emplace_back (String (name) + "=" + value);
+        };
+
+        for (const auto* name : { "HOME", "PATH", "DISPLAY", "XAUTHORITY", "LANG", "LANGUAGE", "LC_ALL",
+                                  "LC_CTYPE", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_DATA_HOME",
+                                  "XDG_CONFIG_HOME", "XDG_CACHE_HOME" })
+            preserveEnvironment (name);
+
+        environment.emplace_back ("GDK_BACKEND=x11");
+
+        if (rendererProfile == 1 || rendererProfile == 2)
+        {
+            environment.emplace_back ("WEBKIT_DISABLE_DMABUF_RENDERER=1");
+            writeDiagnostic ("[JUCE WebView parent] renderer profile disables DMA-BUF");
+        }
+
+        if (rendererProfile == 2)
+        {
+            environment.emplace_back ("WEBKIT_DISABLE_COMPOSITING_MODE=1");
+            writeDiagnostic ("[JUCE WebView parent] renderer profile disables compositing");
+        }
+
+        std::vector<const char*> envp (environment.size() + 1, nullptr);
+        std::transform (environment.begin(), environment.end(), envp.begin(), [] (const auto& item)
+        {
+            return item.toRawUTF8();
+        });
+
         auto pid = fork();
 
         if (pid == 0)
         {
             close (inPipe[0]);
             close (outPipe[1]);
+            close (logPipe[0]);
+
+            if (logPipe[1] != STDOUT_FILENO)
+                dup2 (logPipe[1], STDOUT_FILENO);
+
+            if (logPipe[1] != STDERR_FILENO)
+                dup2 (logPipe[1], STDERR_FILENO);
+
+            if (logPipe[1] > STDERR_FILENO)
+                close (logPipe[1]);
 
             if (JUCEApplicationBase::isStandaloneApp())
             {
-                execv (arguments[0].toRawUTF8(), (char**) argv.data());
+                execve (arguments[0].toRawUTF8(), (char**) argv.data(), (char**) envp.data());
             }
             else
             {
                #if JUCE_USE_EXTERNAL_TEMPORARY_SUBPROCESS
-                execv (arguments[0].toRawUTF8(), (char**) argv.data());
+                execve (arguments[0].toRawUTF8(), (char**) argv.data(), (char**) envp.data());
                #else
                 // After a fork in a multithreaded program, the child can only safely call
                 // async-signal-safe functions until it calls execv, but if we reached this point
@@ -1575,14 +1963,31 @@ private:
                #endif
             }
 
-            exit (0);
+            static constexpr char execFailure[] = "[JUCE WebView helper] exec failed\n";
+            write (STDERR_FILENO, execFailure, sizeof (execFailure) - 1);
+            _exit (127);
+        }
+
+        if (pid < 0)
+        {
+            writeDiagnostic ("[JUCE WebView parent] fork failed: " + String (std::strerror (errno)));
+            close (inPipe[0]);
+            close (inPipe[1]);
+            close (outPipe[0]);
+            close (outPipe[1]);
+            close (logPipe[0]);
+            close (logPipe[1]);
+            return;
         }
 
         close (inPipe[1]);
         close (outPipe[0]);
+        close (logPipe[1]);
 
         inChannel  = inPipe[0];
         outChannel = outPipe[1];
+        logChannel = logPipe[0];
+        CommandReceiver::setBlocking (logChannel, false);
 
         childProcess = pid;
     }
@@ -1603,6 +2008,8 @@ private:
 
             if (result < 0)
                 break;
+
+            drainChildLog();
         }
     }
 
@@ -1659,24 +2066,31 @@ private:
 
     void handleCommand (const String& cmd, const var& params) override
     {
-        MessageManager::callAsync ([liveness = std::weak_ptr (livenessProbe), this, cmd, params]
-                                   {
-                                       if (liveness.lock() != nullptr)
-                                           handleCommandOnMessageThread (cmd, params);
-                                   });
+        const MessageManagerLock messageManagerLock (this);
+
+        if (messageManagerLock.lockWasGained())
+            handleCommandOnMessageThread (cmd, params);
     }
 
-    void receiverHadError() override {}
+    void receiverHadError() override
+    {
+        writeDiagnostic ("[JUCE WebView parent] IPC receiver failed");
+    }
 
     //==============================================================================
     bool webKitIsAvailable = false;
 
     WebBrowserComponent& browser;
     String userAgent;
+    String startupFailure;
+    int rendererProfile = 0;
+    WebBrowserComponent::Options::LinuxWebView::DiagnosticLogCallback diagnosticLogCallback;
     std::unique_ptr<CommandReceiver> receiver;
-    int childProcess = 0, inChannel = 0, outChannel = 0;
+    int childProcess = 0, inChannel = 0, outChannel = 0, logChannel = -1;
+    std::string pendingChildLog;
     int threadControl[2];
     std::unique_ptr<XEmbedComponent> xembed;
+    Rectangle<int> lastBrowserBounds;
     std::shared_ptr<int> livenessProbe = std::make_shared<int> (0);
     std::vector<pollfd> pfds;
     std::optional<TemporaryFile> subprocessFile;
