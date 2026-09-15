@@ -35,8 +35,10 @@ private:
     public:
         Browser (const Options& options, std::function<void()> readyIn)
             : WebBrowserComponent (options), ready (std::move (readyIn)) {}
-        void pageFinishedLoading (const juce::String&) override
+        void pageFinishedLoading (const juce::String& url) override
         {
+            if (! url.startsWith (getResourceProviderRoot()))
+                return;
             // Linux command dispatch deliberately still uses the reader/MML.
             juce::MessageManager::callAsync (ready);
         }
@@ -66,7 +68,7 @@ private:
                                 if (message.contains ("child entry pid="))
                                     helperPid.store (message.fromFirstOccurrenceOf ("child entry pid=", false, false).getIntValue());
                             });
-        auto options = Options{}.withLinuxWebViewOptions (linuxOptions).withResourceProvider ([] (const juce::String&)
+        auto options = Options{}.withNativeIntegrationEnabled().withLinuxWebViewOptions (linuxOptions).withResourceProvider ([] (const juce::String&)
             -> std::optional<juce::WebBrowserComponent::Resource>
         {
             juce::Thread::sleep (25); // Complete the retained URI request asynchronously.
