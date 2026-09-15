@@ -717,6 +717,43 @@ public:
             LinuxWebViewHelpers::closeDescriptor (descriptors[0]);
         }
 
+        beginTest ("An interrupted read retries without losing a framed command");
+        {
+            int descriptors[2];
+            expectEquals (pipe (descriptors), 0);
+            Replies replies;
+            CommandReceiver receiver (&replies, descriptors[0]);
+            CommandReceiver::setBlocking (descriptors[0], true);
+            struct sigaction action {}, previous {};
+            action.sa_handler = [] (int) { readInterrupts = readInterrupts + 1; };
+            sigemptyset (&action.sa_mask);
+            readInterrupts = 0;
+            const auto installed = sigaction (SIGUSR1, &action, &previous) == 0;
+            expect (installed);
+            if (installed)
+            {
+                const ScopeGuard restoreSignal { [&] { sigaction (SIGUSR1, &previous, nullptr); } };
+                const auto readerThread = pthread_self();
+                bool sent = false;
+                std::thread writer ([&]
+                {
+                    Thread::sleep (20);
+                    pthread_kill (readerThread, SIGUSR1);
+                    Thread::sleep (20);
+                    sent = CommandReceiver::sendCommand (descriptors[1], "after-interrupt", {});
+                    LinuxWebViewHelpers::closeDescriptor (descriptors[1]);
+                });
+                receiver.tryNextRead (CommandReceiver::ReturnAfterMessageReceived::yes);
+                writer.join();
+                expect (sent);
+                expect (readInterrupts > 0);
+                expectEquals (replies.errors, 0);
+                expectEquals (replies.commands.joinIntoString (","), String ("after-interrupt"));
+            }
+            LinuxWebViewHelpers::closeDescriptor (descriptors[0]);
+            LinuxWebViewHelpers::closeDescriptor (descriptors[1]);
+        }
+
         beginTest ("Oversized frame fails without allocating its payload");
         {
             int descriptors[2];
@@ -732,6 +769,9 @@ public:
             LinuxWebViewHelpers::closeDescriptor (descriptors[1]);
         }
     }
+
+private:
+    static inline volatile sig_atomic_t readInterrupts = 0;
 };
 
 static LinuxWebViewProtocolTests linuxWebViewProtocolTests;

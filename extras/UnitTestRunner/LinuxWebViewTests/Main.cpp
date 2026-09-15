@@ -1,6 +1,8 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 #include <csignal>
+#include <dirent.h>
 #include <iostream>
+#include <sys/wait.h>
 
 class LinuxWebViewTests final : public juce::JUCEApplication, private juce::Timer
 {
@@ -55,6 +57,28 @@ private:
         }
     }
 
+    void closeBrowser()
+    {
+        const auto start = juce::Time::getMillisecondCounterHiRes();
+        browser.reset();
+        const auto elapsed = juce::Time::getMillisecondCounterHiRes() - start;
+        longestCloseMs = juce::jmax (longestCloseMs, elapsed);
+        require (elapsed < 3000, "browser destruction takes less than three seconds");
+    }
+
+    static int descriptorCount()
+    {
+        auto* directory = opendir ("/proc/self/fd");
+        if (directory == nullptr)
+            return -1;
+        int count = 0;
+        while (const auto* entry = readdir (directory))
+            if (entry->d_name[0] != '.')
+                ++count;
+        closedir (directory);
+        return count - 1; // Exclude the transient directory descriptor itself.
+    }
+
     void openBrowser()
     {
         helperPid.store (0);
@@ -68,9 +92,32 @@ private:
                                 if (message.contains ("child entry pid="))
                                     helperPid.store (message.fromFirstOccurrenceOf ("child entry pid=", false, false).getIntValue());
                             });
-        auto options = Options{}.withNativeIntegrationEnabled().withLinuxWebViewOptions (linuxOptions).withResourceProvider ([] (const juce::String&)
+        auto options = Options{}.withNativeIntegrationEnabled().withLinuxWebViewOptions (linuxOptions).withResourceProvider ([this] (const juce::String& path)
             -> std::optional<juce::WebBrowserComponent::Resource>
         {
+            if (path == "/pending-resource")
+            {
+                pendingResourceObserved.store (true);
+                const auto pid = helperPid.load();
+                auto stopped = pid > 0 && kill (pid, SIGSTOP) == 0;
+                if (stopped)
+                {
+                    // WUNTRACED observes the stop without reaping the live child.
+                    int status = 0;
+                    pid_t waited;
+                    do { waited = waitpid (pid, &status, WUNTRACED); }
+                    while (waited < 0 && errno == EINTR);
+                    stopped = waited == pid && WIFSTOPPED (status);
+                }
+                // The helper cannot consume this resource's response before
+                // destruction. Keep production transport semantics unchanged.
+                juce::MessageManager::callAsync ([this, stopped]
+                {
+                    require (stopped, "pause helper with a URI request outstanding");
+                    closeBrowser();
+                    phase = 10;
+                });
+            }
             juce::Thread::sleep (25); // Complete the retained URI request asynchronously.
             const std::string html = "<!doctype html><html><body>WebView stability test</body></html>";
             return juce::WebBrowserComponent::Resource { std::vector<std::byte> (
@@ -124,10 +171,25 @@ private:
             {
                 require (juce::MessageManager::getInstance()->isThisTheMessageThread(), "failure callback message thread");
                 require (result.getError() != nullptr, "pending callback fails on helper death");
-                browser.reset(); // Destruction from failure delivery must also be safe.
+                closeBrowser(); // Destruction from failure delivery must also be safe.
                 phase = 5;
             });
             kill (pid, SIGKILL);
+        }
+        else if (phase == 6)
+        {
+            phase = 7;
+            browser->evaluateJavascript ("1", [this] (auto result)
+            {
+                require (result.getResult() != nullptr && int (*result.getResult()) == 1, "repeated browser cycle result");
+                closeBrowser();
+                phase = 8;
+            });
+        }
+        else if (phase == 9)
+        {
+            browser->evaluateJavascript ("void fetch('" + juce::WebBrowserComponent::getResourceProviderRoot()
+                                         + "pending-resource')");
         }
     }
 
@@ -139,7 +201,7 @@ private:
         browser->evaluateJavascript ("7", [this] (auto result)
         {
             require (result.getResult() != nullptr && int (*result.getResult()) == 7, "final result");
-            browser.reset(); // This formerly destroyed/joined the active pipe reader.
+            closeBrowser(); // This formerly destroyed/joined the active pipe reader.
             phase = 2;
         });
     }
@@ -151,21 +213,45 @@ private:
             phase = 3;
             openBrowser();
         }
-        if (phase == 5 || failed || juce::Time::getMillisecondCounterHiRes() > deadline)
+        if (phase == 5)
         {
-            require (phase == 5, "runtime sequence completed before deadline");
+            phase = 6;
+            openBrowser();
+        }
+        if (phase == 8)
+        {
+            ++repeatedCycles;
+            const auto descriptors = descriptorCount();
+            require (descriptors >= 0, "read /proc/self/fd");
+            if (repeatedCycles == 3)
+                warmDescriptorCount = descriptors;
+            if (repeatedCycles >= 3)
+                require (descriptors == warmDescriptorCount, "descriptor count stays constant after warmup");
+            phase = repeatedCycles < 6 ? 6 : 9;
+            openBrowser();
+        }
+        if (phase == 10 || failed || juce::Time::getMillisecondCounterHiRes() > deadline)
+        {
+            require (phase == 10, "runtime sequence completed before deadline");
+            require (pendingResourceObserved.load(), "destroy browser with resource response pending");
+            require (descriptorCount() == warmDescriptorCount, "pending resource cancellation releases descriptors");
             setApplicationReturnValue (failed ? 1 : 0);
             if (! failed)
-                std::cout << "Linux WebView runtime: mixed callbacks, callback destruction, reopen, and helper death passed\n";
+                std::cout << "Linux WebView runtime passed: mixed callbacks, callback destruction, helper death, six reopen cycles, "
+                          << "and pending resource cancellation; descriptors=" << warmDescriptorCount
+                          << "; maximum close=" << longestCloseMs << "ms; runtime="
+                          << juce::Time::getMillisecondCounterHiRes() - (deadline - 30000) << "ms\n";
             quit();
         }
     }
 
     std::unique_ptr<Browser> browser;
     std::atomic<int> helperPid { 0 };
+    std::atomic<bool> pendingResourceObserved { false };
     int phase = 0, completed = 0;
+    int repeatedCycles = 0, warmDescriptorCount = -1;
     bool failed = false;
-    double deadline = 0;
+    double deadline = 0, longestCloseMs = 0;
 };
 
 START_JUCE_APPLICATION (LinuxWebViewTests)
