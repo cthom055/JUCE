@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22)
+project(LinuxWebViewTests VERSION 1.0 LANGUAGES C CXX)
+add_subdirectory("../../.." "${CMAKE_CURRENT_BINARY_DIR}/JUCE")
+juce_add_gui_app(LinuxWebViewTests PRODUCT_NAME "Linux WebView Tests" NEEDS_WEB_BROWSER TRUE)
+target_sources(LinuxWebViewTests PRIVATE Main.cpp)
+target_compile_definitions(LinuxWebViewTests PRIVATE JUCE_WEB_BROWSER=1 JUCE_UNIT_TESTS=1 JUCE_USE_CURL=0)
+target_link_libraries(LinuxWebViewTests PRIVATE juce::juce_gui_extra juce::juce_recommended_config_flags)

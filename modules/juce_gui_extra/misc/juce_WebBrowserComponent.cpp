@@ -165,9 +165,8 @@ static void evaluationHandler (WebBrowserComponent::EvaluationResult r)
 {
     if (r.getResult() == nullptr)
     {
-        // The unsupported return type means a successful Javascript evaluation that yielded a
-        // result that cannot be translated and returned to native code such as a Promise.
-        jassert (r.getError()->type == WebBrowserComponent::EvaluationResult::Error::Type::unsupportedReturnType);
+        // Evaluation can also fail when the browser process disconnects. The
+        // caller has no result to consume, but debug builds retain the reason.
         DBG (r.getError()->message);
         return;
     }

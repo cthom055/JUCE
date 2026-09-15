@@ -42,6 +42,7 @@ struct WebKitURISchemeResponse;
 #include <array>
 #include <cstring>
 #include <string>
+#include "juce_WebBrowserComponent_linux_helpers.h"
 
 namespace juce
 {
@@ -510,7 +511,7 @@ public:
         virtual ~Responder() = default;
 
         virtual void handleCommand (const String& cmd, const var& param) = 0;
-        virtual void receiverHadError() = 0;
+        virtual void receiverHadError (const char* reason) = 0;
     };
 
     enum class ReturnAfterMessageReceived
@@ -536,6 +537,9 @@ public:
 
     void tryNextRead (ReturnAfterMessageReceived ret = ReturnAfterMessageReceived::no)
     {
+        if (failed)
+            return;
+
         std::array<char, 65536> incoming;
 
         const auto parseAvailableMessages = [&]()
@@ -551,8 +555,7 @@ public:
                 {
                     buffer.clear();
 
-                    if (responder != nullptr)
-                        responder->receiverHadError();
+                    fail ("oversized IPC frame");
 
                     return true;
                 }
@@ -567,7 +570,7 @@ public:
                 buffer.erase (buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t> (framedSize));
                 parseJSON (json);
 
-                if (ret == ReturnAfterMessageReceived::yes)
+                if (failed || ret == ReturnAfterMessageReceived::yes)
                     return true;
             }
         };
@@ -588,17 +591,17 @@ public:
             if (bytesRead < 0 && errno == EINTR)
                 continue;
 
-            if (bytesRead == 0 && responder != nullptr)
-                responder->receiverHadError();
+            if (bytesRead == 0)
+                fail (buffer.empty() ? "IPC pipe closed" : "truncated IPC frame");
 
-            if (bytesRead < 0 && errno != EAGAIN && errno != EWOULDBLOCK && responder != nullptr)
-                responder->receiverHadError();
+            if (bytesRead < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                fail ("IPC read failed");
 
             break;
         }
     }
 
-    static void sendCommand (int outChannel, const String& cmd, const var& params)
+    static bool sendCommand (int outChannel, const String& cmd, const var& params)
     {
         DynamicObject::Ptr obj = new DynamicObject;
 
@@ -620,37 +623,35 @@ public:
 
         memcpy (dst, json.toRawUTF8(), jsonLength);
 
-        size_t bytesWritten = 0;
-
-        while (bytesWritten < len)
-        {
-            const auto result = write (outChannel, buffer.getData() + bytesWritten, len - bytesWritten);
-
-            if (result > 0)
-            {
-                bytesWritten += static_cast<size_t> (result);
-                continue;
-            }
-
-            if (result < 0 && errno == EINTR)
-                continue;
-
-            return;
-        }
+        return LinuxWebViewHelpers::writeAll (outChannel, buffer.getData(), len);
     }
 
 private:
+    void fail (const char* reason)
+    {
+        if (std::exchange (failed, true))
+            return;
+
+        buffer.clear();
+        if (responder != nullptr)
+            responder->receiverHadError (reason);
+    }
+
     void parseJSON (StringRef json)
     {
         auto object = JSON::fromString (json);
 
-        if (! object.isVoid())
+        if (object.isObject() && object.hasProperty (getCmdIdentifier()))
         {
             auto cmd    = object.getProperty (getCmdIdentifier(),   {}).toString();
             auto params = object.getProperty (getParamIdentifier(), {});
 
             if (responder != nullptr)
                 responder->handleCommand (cmd, params);
+        }
+        else
+        {
+            fail ("invalid IPC command");
         }
     }
 
@@ -660,8 +661,81 @@ private:
     std::vector<char> buffer;
     static constexpr size_t maximumMessageSize = 256 * 1024 * 1024;
     Responder* responder = nullptr;
-    int inChannel = 0;
+    int inChannel = -1;
+    bool failed = false;
 };
+
+#if JUCE_UNIT_TESTS
+class LinuxWebViewProtocolTests final : public UnitTest
+{
+public:
+    LinuxWebViewProtocolTests() : UnitTest ("Linux WebView framing", "Linux WebView") {}
+
+    void runTest() override
+    {
+        struct Replies : CommandReceiver::Responder
+        {
+            void handleCommand (const String& command, const var&) override { commands.add (command); }
+            void receiverHadError (const char*) override { ++errors; }
+            StringArray commands;
+            int errors = 0;
+        };
+
+        beginTest ("Commands remain ordered and EOF is terminal");
+        {
+            int descriptors[2];
+            expectEquals (pipe (descriptors), 0);
+            Replies replies;
+            CommandReceiver receiver (&replies, descriptors[0]);
+            expect (CommandReceiver::sendCommand (descriptors[1], "first", {}));
+            expect (CommandReceiver::sendCommand (descriptors[1], "second", {}));
+            LinuxWebViewHelpers::closeDescriptor (descriptors[1]);
+            receiver.tryNextRead();
+            receiver.tryNextRead();
+            expectEquals (replies.commands.joinIntoString (","), String ("first,second"));
+            expectEquals (replies.errors, 1);
+            LinuxWebViewHelpers::closeDescriptor (descriptors[0]);
+        }
+
+        beginTest ("Partial header survives until completed; truncated body fails once");
+        {
+            int descriptors[2];
+            expectEquals (pipe (descriptors), 0);
+            Replies replies;
+            CommandReceiver receiver (&replies, descriptors[0]);
+            const size_t length = 100;
+            const auto* header = reinterpret_cast<const char*> (&length);
+            expect (LinuxWebViewHelpers::writeAll (descriptors[1], header, 1));
+            receiver.tryNextRead();
+            expectEquals (replies.errors, 0);
+            expect (LinuxWebViewHelpers::writeAll (descriptors[1], header + 1, sizeof (length) - 1));
+            LinuxWebViewHelpers::closeDescriptor (descriptors[1]);
+            receiver.tryNextRead();
+            receiver.tryNextRead();
+            expectEquals (replies.errors, 1);
+            expect (replies.commands.isEmpty());
+            LinuxWebViewHelpers::closeDescriptor (descriptors[0]);
+        }
+
+        beginTest ("Oversized frame fails without allocating its payload");
+        {
+            int descriptors[2];
+            expectEquals (pipe (descriptors), 0);
+            Replies replies;
+            CommandReceiver receiver (&replies, descriptors[0]);
+            const size_t oversized = 256 * 1024 * 1024 + 1;
+            expect (LinuxWebViewHelpers::writeAll (descriptors[1], &oversized, sizeof (oversized)));
+            receiver.tryNextRead();
+            receiver.tryNextRead();
+            expectEquals (replies.errors, 1);
+            LinuxWebViewHelpers::closeDescriptor (descriptors[0]);
+            LinuxWebViewHelpers::closeDescriptor (descriptors[1]);
+        }
+    }
+};
+
+static LinuxWebViewProtocolTests linuxWebViewProtocolTests;
+#endif
 
 #define juce_g_signal_connect(instance, detailed_signal, c_handler, data) \
     WebKitSymbols::getInstance()->juce_g_signal_connect_data (instance, detailed_signal, c_handler, data, nullptr, (GConnectFlags) 0)
@@ -924,8 +998,19 @@ public:
         WebKitSymbols::getInstance()->juce_g_unix_fd_add (receiver.getFd(), G_IO_IN, pipeReadyStatic, this);
         receiver.tryNextRead();
 
-        WebKitSymbols::getInstance()->juce_gtk_main();
+        if (! transportFailed && ! quitRequested)
+        {
+            eventLoopRunning = true;
+            WebKitSymbols::getInstance()->juce_gtk_main();
+            eventLoopRunning = false;
+        }
 
+        // These references must be released while the loaded GObject functions
+        // are still alive, not later when GtkChildProcess members are destroyed.
+        requestIds.clear();
+        for (auto* decision : decisions)
+            wk.juce_g_object_unref (decision);
+        decisions.clear();
         WebKitSymbols::getInstance()->deleteInstance();
         return 0;
     }
@@ -937,7 +1022,7 @@ public:
         auto s = wk.juce_jsc_value_to_string (wk.juce_webkit_javascript_result_get_js_value (r));
         if (initialisationData->diagnosticsEnabled)
             std::cerr << "[JUCE WebView helper] native integration callback" << std::endl;
-        CommandReceiver::sendCommand (outChannel, "invokeCallback", var (s));
+        sendCommand ("invokeCallback", var (s));
         wk.juce_g_free (s);
     }
 
@@ -1019,8 +1104,8 @@ public:
         WebKitSymbols::getInstance()->juce_webkit_web_view_run_javascript (webview,
                                                                            jsParams->script.toRawUTF8(),
                                                                            nullptr,
-                                                                           javascriptFinishedCallback,
-                                                                           this);
+                                                                           jsParams->requireCallback ? javascriptFinishedCallback : nullptr,
+                                                                           jsParams->requireCallback ? this : nullptr);
     }
 
     void handleResourceRequestedResponse (const var& params)
@@ -1035,7 +1120,10 @@ public:
             return;
         }
 
-        auto* request = requestIds.remove (response->requestId);
+        auto request = requestIds.remove (response->requestId);
+
+        if (request == nullptr)
+            return;
 
         if (initialisationData->diagnosticsEnabled)
             std::cerr << "[JUCE WebView helper] resource response id=" << response->requestId
@@ -1064,7 +1152,7 @@ public:
 
             wk.juce_webkit_uri_scheme_response_set_http_headers (webkitResponse, headers);
             wk.juce_webkit_uri_scheme_response_set_status (webkitResponse, 200, nullptr);
-            wk.juce_webkit_uri_scheme_request_finish_with_response (request, webkitResponse);
+            wk.juce_webkit_uri_scheme_request_finish_with_response (request.get(), webkitResponse);
 
             return;
         }
@@ -1077,7 +1165,7 @@ public:
 
         wk.juce_webkit_uri_scheme_response_set_http_headers (webkitResponse, headers);
         wk.juce_webkit_uri_scheme_response_set_status (webkitResponse, 404, nullptr);
-        wk.juce_webkit_uri_scheme_request_finish_with_response (request, webkitResponse);
+        wk.juce_webkit_uri_scheme_request_finish_with_response (request.get(), webkitResponse);
     }
 
     //==============================================================================
@@ -1097,9 +1185,26 @@ public:
         else if (cmd == ResourceRequestResponse::key) handleResourceRequestedResponse (params);
     }
 
-    void receiverHadError() override
+    void receiverHadError (const char* reason) override
     {
-        exit (-1);
+        if (std::exchange (transportFailed, true))
+            return;
+
+        std::cerr << "[JUCE WebView helper] " << reason << std::endl;
+        if (eventLoopRunning)
+            quit();
+    }
+
+    bool sendCommand (const String& command, const var& params)
+    {
+        if (transportFailed)
+            return false;
+
+        if (CommandReceiver::sendCommand (outChannel, command, params))
+            return true;
+
+        receiverHadError ("IPC write failed");
+        return false;
     }
 
     //==============================================================================
@@ -1116,7 +1221,9 @@ public:
 
     void quit()
     {
-        WebKitSymbols::getInstance()->juce_gtk_main_quit();
+        quitRequested = true;
+        if (eventLoopRunning)
+            WebKitSymbols::getInstance()->juce_gtk_main_quit();
     }
 
     String getURIStringForAction (WebKitNavigationAction* action)
@@ -1138,7 +1245,7 @@ public:
 
             params->setProperty ("url", getURIStringForAction (action));
             params->setProperty ("decision_id", (int64) decision);
-            CommandReceiver::sendCommand (outChannel, "pageAboutToLoad", var (params.get()));
+            sendCommand ("pageAboutToLoad", var (params.get()));
 
             return true;
         }
@@ -1155,7 +1262,7 @@ public:
             DynamicObject::Ptr params = new DynamicObject;
 
             params->setProperty ("url", getURIStringForAction (action));
-            CommandReceiver::sendCommand (outChannel, "newWindowAttemptingToLoad", var (params.get()));
+            sendCommand ("newWindowAttemptingToLoad", var (params.get()));
 
             // never allow new windows
             WebKitSymbols::getInstance()->juce_webkit_policy_decision_ignore (decision);
@@ -1177,7 +1284,7 @@ public:
             DynamicObject::Ptr params = new DynamicObject;
 
             params->setProperty ("url", String (WebKitSymbols::getInstance()->juce_webkit_web_view_get_uri (webview)));
-            CommandReceiver::sendCommand (outChannel, "pageFinishedLoading", var (params.get()));
+            sendCommand ("pageFinishedLoading", var (params.get()));
         }
     }
 
@@ -1230,30 +1337,13 @@ public:
         DynamicObject::Ptr params = new DynamicObject;
 
         params->setProperty ("error", message);
-        CommandReceiver::sendCommand (outChannel, "pageLoadHadNetworkError", var (params.get()));
+        sendCommand ("pageLoadHadNetworkError", var (params.get()));
     }
 
 private:
     void writeStartupHandle (unsigned long handle) const
     {
-        const auto* data = reinterpret_cast<const char*> (&handle);
-        size_t written = 0;
-
-        while (written < sizeof (handle))
-        {
-            const auto result = write (outChannel, data + written, sizeof (handle) - written);
-
-            if (result > 0)
-            {
-                written += static_cast<size_t> (result);
-                continue;
-            }
-
-            if (result < 0 && errno == EINTR)
-                continue;
-
-            break;
-        }
+        LinuxWebViewHelpers::writeAll (outChannel, &handle, sizeof (handle));
     }
 
     void handleEvaluationCallback (const std::optional<var>& value, const String& error)
@@ -1261,7 +1351,7 @@ private:
         const auto success = value.has_value();
         const auto hasPayload = success && ! value->isUndefined();
 
-        CommandReceiver::sendCommand (outChannel,
+        sendCommand (
                                       EvaluateJavascriptCallbackParams::key,
                                       *ToVar::convert (EvaluateJavascriptCallbackParams { success,
                                                                                           hasPayload,
@@ -1275,7 +1365,7 @@ private:
         if (initialisationData->diagnosticsEnabled)
             std::cerr << "[JUCE WebView helper] resource request id=" << requestId
                       << " path=" << path << std::endl;
-        CommandReceiver::sendCommand (outChannel,
+        sendCommand (
                                       ResourceRequest::key,
                                       *ToVar::convert (ResourceRequest { requestId, path }));
     }
@@ -1390,40 +1480,6 @@ private:
         reinterpret_cast<GtkChildProcess*> (user)->handleResourceRequestedCallback (request, path);
     }
 
-    class RequestIds
-    {
-    public:
-        int64 insert (WebKitURISchemeRequest* request)
-        {
-            const auto requestId = nextRequestId++;
-
-            if (nextRequestId == std::numeric_limits<int64>::max())
-                nextRequestId = 0;
-
-            requests[requestId] = request;
-            return requestId;
-        }
-
-        WebKitURISchemeRequest* remove (int64 requestId)
-        {
-            auto it = requests.find (requestId);
-
-            if (it == requests.end())
-            {
-                std::cerr << "Outstanding request not found for id " << requestId << std::endl;
-                return nullptr;
-            }
-
-            auto r = it->second;
-            requests.erase (it);
-
-            return r;
-        }
-
-    private:
-        std::map<int64, WebKitURISchemeRequest*> requests;
-        int64 nextRequestId = 0;
-    };
 
     int outChannel = 0;
     CommandReceiver receiver;
@@ -1432,7 +1488,13 @@ private:
     Array<WebKitPolicyDecision*> decisions;
     WebKitUserContentManager* manager = nullptr;
     std::optional<InitialisationData> initialisationData;
-    RequestIds requestIds;
+    LinuxWebViewHelpers::PendingRequests<WebKitURISchemeRequest> requestIds {
+        [] (WebKitURISchemeRequest* request) { WebKitSymbols::getInstance()->juce_g_object_ref (request); },
+        [] (WebKitURISchemeRequest* request) { WebKitSymbols::getInstance()->juce_g_object_unref (request); }
+    };
+    bool transportFailed = false;
+    bool eventLoopRunning = false;
+    bool quitRequested = false;
 };
 
 //==============================================================================
@@ -1462,6 +1524,7 @@ public:
 
     ~Platform() override
     {
+        livenessProbe.reset();
         quit();
     }
 
@@ -1480,12 +1543,19 @@ public:
 
     void evaluateJavascript (const String& script, WebBrowserComponent::EvaluationCallback callback) override
     {
-        if (callback != nullptr)
+        const auto requireCallback = callback != nullptr;
+        if (transportFailed.load())
+        {
+            if (requireCallback)
+                deliverEvaluation (std::move (callback), disconnectedResult());
+            return;
+        }
+
+        if (requireCallback)
             evaluationCallbacks.push_back (std::move (callback));
 
-        CommandReceiver::sendCommand (outChannel,
-                                      "evaluateJavascript",
-                                      *ToVar::convert (EvaluateJavascriptParams { script, callback != nullptr }));
+        sendCommand ("evaluateJavascript",
+                     *ToVar::convert (EvaluateJavascriptParams { script, requireCallback }));
     }
 
     void handleJavascriptEvaluationCallback (const var& paramsIn)
@@ -1513,9 +1583,9 @@ public:
             return EvaluationResult { params->hasPayload ? params->payload : var::undefined() };
         }();
 
-        auto& cb = evaluationCallbacks.front();
-        cb (result);
+        auto callback = std::move (evaluationCallbacks.front());
         evaluationCallbacks.pop_front();
+        deliverEvaluation (std::move (callback), result);
     }
 
     void handleResourceRequest (const var& paramsIn)
@@ -1530,7 +1600,7 @@ public:
 
         const auto response = browser.impl->handleResourceRequest (params->path);
 
-        CommandReceiver::sendCommand (outChannel,
+        sendCommand (
                                       ResourceRequestResponse::key,
                                       *ToVar::convert (ResourceRequestResponse { params->requestId, response }));
     }
@@ -1555,16 +1625,26 @@ public:
             return;
         }
 
-        [[maybe_unused]] auto ret = pipe (threadControl);
-
-        jassert (ret == 0);
+        if (pipe (threadControl) != 0)
+        {
+            startupFailure = "Solstice could not create its WebView communication channel.";
+            quit();
+            return;
+        }
 
         CommandReceiver::setBlocking (inChannel,        true);
         CommandReceiver::setBlocking (outChannel,       true);
         CommandReceiver::setBlocking (threadControl[0], false);
-        CommandReceiver::setBlocking (threadControl[1], true);
+        CommandReceiver::setBlocking (threadControl[1], false);
+        fcntl (threadControl[0], F_SETFD, FD_CLOEXEC);
+        fcntl (threadControl[1], F_SETFD, FD_CLOEXEC);
 
-        CommandReceiver::sendCommand (outChannel, "init", *ToVar::convert (initialisationData));
+        if (! CommandReceiver::sendCommand (outChannel, "init", *ToVar::convert (initialisationData)))
+        {
+            startupFailure = "Solstice could not communicate with its WebView helper.";
+            quit();
+            return;
+        }
 
         static constexpr int startupTimeoutMs = 10000;
         std::array<pollfd, 2> startupPoll {{ { inChannel,  POLLIN | POLLHUP | POLLERR, 0 },
@@ -1598,6 +1678,7 @@ public:
 
             if ((startupPoll[1].revents & (POLLIN | POLLHUP | POLLERR)) != 0)
                 drainChildLog();
+            startupPoll[1].fd = logChannel;
 
             startupReady = (startupPoll[0].revents & (POLLIN | POLLHUP)) != 0;
 
@@ -1611,13 +1692,14 @@ public:
                                ? "Solstice timed out while starting WebKitGTK.\nThe host remains responsive; see the Solstice log for details."
                                : "Solstice could not communicate with its WebKitGTK helper.\nSee the Solstice log for details.";
             writeDiagnostic ("[JUCE WebView parent] helper startup failed or timed out");
-            killChild();
+            quit();
             browser.repaint();
             return;
         }
 
         unsigned long windowHandle = 0;
         size_t received = 0;
+        CommandReceiver::setBlocking (inChannel, false);
 
         while (received < sizeof (windowHandle))
         {
@@ -1634,6 +1716,16 @@ public:
             if (actual < 0 && errno == EINTR)
                 continue;
 
+            if (actual < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            {
+                const auto remaining = static_cast<int> (startupDeadline - Time::getMillisecondCounterHiRes());
+                if (remaining > 0)
+                {
+                    pollfd fd { inChannel, POLLIN | POLLHUP | POLLERR, 0 };
+                    poll (&fd, 1, jmin (remaining, 250));
+                    continue;
+                }
+            }
             break;
         }
 
@@ -1641,7 +1733,7 @@ public:
         {
             startupFailure = "Solstice could not initialise WebKitGTK.\nInstall a supported runtime and inspect the Solstice log for the failed library or symbol.";
             writeDiagnostic ("[JUCE WebView parent] helper returned no XEmbed window");
-            killChild();
+            quit();
             browser.repaint();
             return;
         }
@@ -1654,8 +1746,6 @@ public:
         pfds.push_back ({ receiver->getFd(), POLLIN, 0 });
         pfds.push_back ({ logChannel,        POLLIN | POLLHUP | POLLERR, 0 });
 
-        startThread();
-
         xembed.reset (new XEmbedComponent (windowHandle));
         if (! lastBrowserBounds.isEmpty())
         {
@@ -1665,36 +1755,30 @@ public:
             xembed->setBounds (lastBrowserBounds);
         }
         browser.addAndMakeVisible (xembed.get());
+        startThread();
     }
 
     void quit()
     {
-        if (isThreadRunning())
+        shuttingDown.store (true);
+        const auto connectionWasHealthy = ! transportFailed.exchange (true);
+        signalThreadShouldExit();
+        wakeReader();
+
+        // The small quit frame is one atomic pipe write. If the pipe is full,
+        // abandon the connection rather than blocking the host during teardown.
+        if (connectionWasHealthy && outChannel >= 0)
         {
-            signalThreadShouldExit();
-
-            char ignore = 0;
-            ssize_t ret;
-
-            for (;;)
-            {
-                ret = write (threadControl[1], &ignore, 1);
-
-                if (ret != -1 || errno != EINTR)
-                    break;
-            }
-
-            waitForThreadToExit (-1);
-            receiver = nullptr;
-        }
-
-        if (childProcess != 0)
-        {
+            CommandReceiver::setBlocking (outChannel, false);
             CommandReceiver::sendCommand (outChannel, "quit", {});
-            killChild();
         }
 
-        closeLogChannel();
+        // Terminating the helper also releases any in-flight blocking pipe write
+        // before we join the reader. No GUI-lock rendezvous is required to stop.
+        killChild();
+        waitForThreadToExit (-1);
+        receiver = nullptr;
+        closeChannels();
     }
 
     //==============================================================================
@@ -1713,13 +1797,13 @@ public:
         if (postData != nullptr)
             params->setProperty ("postData", var (*postData));
 
-        CommandReceiver::sendCommand (outChannel, "goToURL", var (params.get()));
+        sendCommand ("goToURL", var (params.get()));
     }
 
-    void goBack() override    { if (webKitIsAvailable) CommandReceiver::sendCommand (outChannel, "goBack",    {}); }
-    void goForward() override { if (webKitIsAvailable) CommandReceiver::sendCommand (outChannel, "goForward", {}); }
-    void refresh() override   { if (webKitIsAvailable) CommandReceiver::sendCommand (outChannel, "refresh",   {}); }
-    void stop() override      { if (webKitIsAvailable) CommandReceiver::sendCommand (outChannel, "stop",      {}); }
+    void goBack() override    { if (webKitIsAvailable) sendCommand ("goBack",    {}); }
+    void goForward() override { if (webKitIsAvailable) sendCommand ("goForward", {}); }
+    void refresh() override   { if (webKitIsAvailable) sendCommand ("refresh",   {}); }
+    void stop() override      { if (webKitIsAvailable) sendCommand ("stop",      {}); }
 
     void resized()
     {
@@ -1738,37 +1822,87 @@ private:
     //==============================================================================
     void killChild()
     {
-        if (childProcess != 0)
+        xembed = nullptr;
+        if (childProcess <= 0)
+            return;
+
+        if (LinuxWebViewHelpers::terminateChild (childProcess))
         {
-            xembed = nullptr;
-
-            int status = 0, result = 0;
-
-            result = waitpid (childProcess, &status, WNOHANG);
-            for (int i = 0; i < 15 && (! WIFEXITED (status) || result != childProcess); ++i)
-            {
-                Thread::sleep (100);
-                result = waitpid (childProcess, &status, WNOHANG);
-            }
-
-            // clean-up any zombies
-            status = 0;
-            if (! WIFEXITED (status) || result != childProcess)
-            {
-                for (;;)
-                {
-                    kill (childProcess, SIGTERM);
-                    waitpid (childProcess, &status, 0);
-
-                    if (WIFEXITED (status))
-                        break;
-                }
-            }
-
             childProcess = 0;
         }
+        else if (! std::exchange (childReapFailureReported, true))
+        {
+            // Keep the PID for a later teardown attempt. A detached reaper
+            // could execute unloaded plugin code after the host removes us.
+            writeDiagnostic ("[JUCE WebView parent] helper did not exit before the shutdown deadline");
+        }
+    }
 
-        drainChildLog (true);
+    void wakeReader()
+    {
+        if (threadControl[1] >= 0)
+        {
+            const char wake = 0;
+            LinuxWebViewHelpers::writeAll (threadControl[1], &wake, sizeof (wake));
+        }
+    }
+
+    void closeChannels()
+    {
+        closeLogChannel();
+        LinuxWebViewHelpers::closeDescriptor (inChannel);
+        LinuxWebViewHelpers::closeDescriptor (outChannel);
+        LinuxWebViewHelpers::closeDescriptor (threadControl[0]);
+        LinuxWebViewHelpers::closeDescriptor (threadControl[1]);
+        pfds.clear();
+    }
+
+    bool sendCommand (const String& command, const var& params)
+    {
+        if (transportFailed.load() || shuttingDown.load())
+            return false;
+
+        if (CommandReceiver::sendCommand (outChannel, command, params))
+            return true;
+
+        receiverHadError ("IPC write failed");
+        return false;
+    }
+
+    static EvaluationResult disconnectedResult()
+    {
+        using Error = EvaluationResult::Error;
+        return Error { Error::Type::unknown, "Linux WebView disconnected" };
+    }
+
+    void deliverEvaluation (EvaluationCallback callback, EvaluationResult result)
+    {
+        // A callback may destroy the browser. Deliver on the actual message
+        // thread, never on the pipe reader whose stack still owns the receiver.
+        const auto alive = weakLivenessProbe;
+        MessageManager::callAsync ([alive, callback = std::move (callback), result = std::move (result)]
+        {
+            if (! alive.expired())
+                callback (result);
+        });
+    }
+
+    void showDisconnected()
+    {
+        webKitIsAvailable = false;
+        quit();
+        startupFailure = "Solstice's interface stopped.\nClose and reopen the editor.";
+        browser.repaint();
+
+        auto callbacks = std::move (evaluationCallbacks);
+        evaluationCallbacks.clear();
+        const auto alive = weakLivenessProbe;
+        for (auto& callback : callbacks)
+        {
+            if (alive.expired())
+                return;
+            callback (disconnectedResult());
+        }
     }
 
     void writeDiagnostic (const String& message) const
@@ -1785,70 +1919,66 @@ private:
             return;
 
         std::array<char, 4096> bytes;
-
-        for (;;)
+        bool closed = false;
+        // A noisy helper must not starve command reads or shutdown.
+        for (int chunk = 0; chunk < 16; ++chunk)
         {
             const auto count = read (logChannel, bytes.data(), bytes.size());
-
             if (count > 0)
             {
                 pendingChildLog.append (bytes.data(), static_cast<size_t> (count));
                 continue;
             }
-
             if (count < 0 && errno == EINTR)
                 continue;
-
+            closed = count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
             break;
         }
 
         for (;;)
         {
             const auto newline = pendingChildLog.find ('\n');
-
             if (newline == std::string::npos)
                 break;
 
             auto line = pendingChildLog.substr (0, newline);
             pendingChildLog.erase (0, newline + 1);
-
             if (! line.empty() && line.back() == '\r')
                 line.pop_back();
-
             if (! line.empty())
                 writeDiagnostic (String::fromUTF8 (line.data(), static_cast<int> (line.size())));
         }
 
-        if (flushPartialLine && ! pendingChildLog.empty())
+        if (pendingChildLog.size() > 65536)
+            pendingChildLog.erase (0, pendingChildLog.size() - 65536);
+
+        if ((flushPartialLine || closed) && ! pendingChildLog.empty())
         {
-            writeDiagnostic (String::fromUTF8 (pendingChildLog.data(),
-                                               static_cast<int> (pendingChildLog.size())));
+            writeDiagnostic (String::fromUTF8 (pendingChildLog.data(), static_cast<int> (pendingChildLog.size())));
             pendingChildLog.clear();
+        }
+
+        if (closed)
+        {
+            const auto oldChannel = logChannel;
+            LinuxWebViewHelpers::closeDescriptor (logChannel);
+            for (auto& fd : pfds)
+                if (fd.fd == oldChannel)
+                    fd.fd = -1;
         }
     }
 
     void closeLogChannel()
     {
-        if (logChannel < 0)
-            return;
-
         drainChildLog (true);
-        close (logChannel);
-        logChannel = -1;
+        LinuxWebViewHelpers::closeDescriptor (logChannel);
     }
 
     void launchChild()
     {
-        int inPipe[2], outPipe[2], logPipe[2];
+        int inPipe[2] { -1, -1 }, outPipe[2] { -1, -1 }, logPipe[2] { -1, -1 };
 
-        [[maybe_unused]] auto ret = pipe (inPipe);
-        jassert (ret == 0);
-
-        ret = pipe (outPipe);
-        jassert (ret == 0);
-
-        ret = pipe (logPipe);
-        if (ret != 0)
+        if (pipe (inPipe) != 0 || pipe (outPipe) != 0 || pipe (logPipe) != 0)
         {
             writeDiagnostic ("[JUCE WebView parent] diagnostic pipe failed: " + String (std::strerror (errno)));
             close (inPipe[0]);
@@ -1988,37 +2118,34 @@ private:
         outChannel = outPipe[1];
         logChannel = logPipe[0];
         CommandReceiver::setBlocking (logChannel, false);
+        fcntl (inChannel, F_SETFD, FD_CLOEXEC);
+        fcntl (outChannel, F_SETFD, FD_CLOEXEC);
+        fcntl (logChannel, F_SETFD, FD_CLOEXEC);
 
         childProcess = pid;
     }
 
     void run() override
     {
-        while (! threadShouldExit())
+        while (! threadShouldExit() && ! transportFailed.load())
         {
-            if (shouldExit())
+            receiver->tryNextRead();
+            if (threadShouldExit() || transportFailed.load())
                 return;
 
-            receiver->tryNextRead();
-
             int result = 0;
+            while (! threadShouldExit() && (result == 0 || (result < 0 && errno == EINTR)))
+                result = poll (pfds.data(), static_cast<nfds_t> (pfds.size()), 10);
 
-            while (result == 0 || (result < 0 && errno == EINTR))
-                result = poll (&pfds.front(), static_cast<nfds_t> (pfds.size()), 10);
-
-            if (result < 0)
-                break;
-
+            if (threadShouldExit())
+                return;
+            if (result < 0 || (pfds[1].revents & POLLNVAL) != 0)
+            {
+                receiverHadError ("IPC poll failed");
+                return;
+            }
             drainChildLog();
         }
-    }
-
-    bool shouldExit()
-    {
-        char ignore;
-        auto result = read (threadControl[0], &ignore, 1);
-
-        return (result != -1 || (errno != EAGAIN && errno != EWOULDBLOCK));
     }
 
     //==============================================================================
@@ -2052,7 +2179,7 @@ private:
             params->setProperty ("decision_id", decision_id);
             params->setProperty ("allow", browser.pageAboutToLoad (url));
 
-            CommandReceiver::sendCommand (outChannel, "decision", var (params.get()));
+            sendCommand ("decision", var (params.get()));
         }
     }
 
@@ -2072,13 +2199,26 @@ private:
             handleCommandOnMessageThread (cmd, params);
     }
 
-    void receiverHadError() override
+    void receiverHadError (const char* reason) override
     {
-        writeDiagnostic ("[JUCE WebView parent] IPC receiver failed");
+        if (transportFailed.exchange (true) || shuttingDown.load())
+            return;
+
+        writeDiagnostic (String ("[JUCE WebView parent] IPC disconnected: ") + reason);
+        signalThreadShouldExit();
+        wakeReader();
+        const auto alive = weakLivenessProbe;
+        MessageManager::callAsync ([this, alive]
+        {
+            if (! alive.expired())
+                showDisconnected();
+        });
     }
 
     //==============================================================================
     bool webKitIsAvailable = false;
+    bool childReapFailureReported = false;
+    std::atomic<bool> transportFailed { false }, shuttingDown { false };
 
     WebBrowserComponent& browser;
     String userAgent;
@@ -2086,12 +2226,13 @@ private:
     int rendererProfile = 0;
     WebBrowserComponent::Options::LinuxWebView::DiagnosticLogCallback diagnosticLogCallback;
     std::unique_ptr<CommandReceiver> receiver;
-    int childProcess = 0, inChannel = 0, outChannel = 0, logChannel = -1;
+    int childProcess = 0, inChannel = -1, outChannel = -1, logChannel = -1;
     std::string pendingChildLog;
-    int threadControl[2];
+    int threadControl[2] { -1, -1 };
     std::unique_ptr<XEmbedComponent> xembed;
     Rectangle<int> lastBrowserBounds;
     std::shared_ptr<int> livenessProbe = std::make_shared<int> (0);
+    const std::weak_ptr<int> weakLivenessProbe = livenessProbe;
     std::vector<pollfd> pfds;
     std::optional<TemporaryFile> subprocessFile;
     std::deque<EvaluationCallback> evaluationCallbacks;
