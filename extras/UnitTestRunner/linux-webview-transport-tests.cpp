@@ -78,7 +78,7 @@ static void testPartialWrites()
     assert (pipe (descriptors) == 0);
     std::thread disappearingReader ([&]
     {
-        std::array<char, 4096> bytes;
+        std::array<char, 4096> bytes {};
         assert (read (descriptors[0], bytes.data(), bytes.size()) > 0);
         close (descriptors[0]);
     });
