@@ -43,6 +43,7 @@ struct WebKitURISchemeResponse;
 #include <cstring>
 #include <string>
 #include "juce_WebBrowserComponent_linux_helpers.h"
+#include "juce_WebBrowserComponent_linux_dispatch.h"
 
 namespace juce
 {
@@ -534,6 +535,7 @@ public:
     }
 
     int getFd() const     { return inChannel; }
+    size_t getMessageBytes() const { return messageBytes; }
 
     void tryNextRead (ReturnAfterMessageReceived ret = ReturnAfterMessageReceived::no)
     {
@@ -568,6 +570,7 @@ public:
                 const auto* jsonStart = buffer.data() + sizeof (size_t);
                 String json (CharPointer_UTF8 (jsonStart), CharPointer_UTF8 (jsonStart + numBytesExpected));
                 buffer.erase (buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t> (framedSize));
+                messageBytes = numBytesExpected;
                 parseJSON (json);
 
                 if (failed || ret == ReturnAfterMessageReceived::yes)
@@ -658,6 +661,7 @@ private:
     static Identifier getCmdIdentifier()    { static Identifier Id ("cmd");    return Id; }
     static Identifier getParamIdentifier()  { static Identifier Id ("params"); return Id; }
 
+    size_t messageBytes = 0;
     std::vector<char> buffer;
     static constexpr size_t maximumMessageSize = 256 * 1024 * 1024;
     Responder* responder = nullptr;
@@ -1565,6 +1569,7 @@ public:
     ~Platform() override
     {
         livenessProbe.reset();
+        pendingCommands.cancel();
         quit();
     }
 
@@ -1638,7 +1643,10 @@ public:
             return;
         }
 
+        const auto alive = weakLivenessProbe;
         const auto response = browser.impl->handleResourceRequest (params->path);
+        if (alive.expired())
+            return;
 
         sendCommand (
                                       ResourceRequestResponse::key,
@@ -1817,6 +1825,17 @@ public:
         // before we join the reader. No GUI-lock rendezvous is required to stop.
         killChild();
         waitForThreadToExit (-1);
+        pendingCommands.cancel();
+        if (dispatchDiagnostics && ! std::exchange (dispatchReported, true))
+        {
+            const auto stats = pendingCommands.getStats();
+            writeDiagnostic ("[JUCE WebView dispatch] mode=" + String (legacyDispatch ? "legacy" : "queued")
+                + " commands=" + String (static_cast<int64> (legacyDispatch ? legacyCommands : stats.delivered))
+                + " peak_queue=" + String (static_cast<int64> (stats.peakCount))
+                + " peak_bytes=" + String (static_cast<int64> (stats.peakBytes))
+                + " max_wait_ms=" + String (legacyDispatch ? legacyMaxWaitMs : stats.maxWaitMs, 3)
+                + " total_wait_ms=" + String (legacyDispatch ? legacyTotalWaitMs : stats.totalWaitMs, 3));
+        }
         receiver = nullptr;
         closeChannels();
     }
@@ -2217,7 +2236,11 @@ private:
             DynamicObject::Ptr params = new DynamicObject;
 
             params->setProperty ("decision_id", decision_id);
-            params->setProperty ("allow", browser.pageAboutToLoad (url));
+            const auto alive = weakLivenessProbe;
+            const auto allow = browser.pageAboutToLoad (url);
+            if (alive.expired())
+                return;
+            params->setProperty ("allow", allow);
 
             sendCommand ("decision", var (params.get()));
         }
@@ -2233,10 +2256,66 @@ private:
 
     void handleCommand (const String& cmd, const var& params) override
     {
-        const MessageManagerLock messageManagerLock (this);
+        if (transportFailed.load() || shuttingDown.load())
+            return;
 
-        if (messageManagerLock.lockWasGained())
-            handleCommandOnMessageThread (cmd, params);
+        if (legacyDispatch)
+        {
+            const auto start = Time::getMillisecondCounterHiRes();
+            const MessageManagerLock messageManagerLock (this);
+            const auto wait = Time::getMillisecondCounterHiRes() - start;
+            ++legacyCommands;
+            legacyTotalWaitMs += wait;
+            legacyMaxWaitMs = jmax (legacyMaxWaitMs, wait);
+            if (messageManagerLock.lockWasGained())
+                handleCommandOnMessageThread (cmd, params);
+            return;
+        }
+
+        const auto result = pendingCommands.push ({ cmd, params }, receiver->getMessageBytes(),
+                                                   Time::getMillisecondCounterHiRes());
+        if (result == PendingCommands::Push::rejected)
+            receiverHadError ("message-thread command queue limit exceeded");
+        else if (result == PendingCommands::Push::schedule)
+            scheduleCommandDispatch (false);
+    }
+
+    void scheduleCommandDispatch (bool yieldToHost)
+    {
+        const auto alive = weakLivenessProbe;
+        auto callback = [this, alive]
+        {
+            if (! alive.expired())
+                dispatchCommands();
+        };
+        // Posting another immediate message here can keep JUCE's drain-until-empty
+        // loop occupied indefinitely. A timer yields between bounded batches.
+        if (yieldToHost)
+            Timer::callAfterDelay (1, std::move (callback));
+        else if (! MessageManager::callAsync (std::move (callback)))
+            receiverHadError ("could not schedule browser command dispatch");
+    }
+
+    void dispatchCommands()
+    {
+        jassert (MessageManager::getInstance()->isThisTheMessageThread());
+        const auto alive = weakLivenessProbe;
+        const auto deadline = Time::getMillisecondCounterHiRes() + 2.0;
+        for (int count = 0; count < 32; ++count)
+        {
+            if (transportFailed.load() || shuttingDown.load())
+                return;
+            auto command = pendingCommands.pop (Time::getMillisecondCounterHiRes());
+            if (! command)
+                return;
+            handleCommandOnMessageThread (command->first, command->second);
+            // Native listeners may destroy the editor. Do not touch this again.
+            if (alive.expired())
+                return;
+            if (Time::getMillisecondCounterHiRes() >= deadline)
+                break;
+        }
+        scheduleCommandDispatch (true);
     }
 
     void receiverHadError (const char* reason) override
@@ -2256,6 +2335,13 @@ private:
     }
 
     //==============================================================================
+    using PendingCommands = LinuxWebViewHelpers::DispatchQueue<std::pair<String, var>>;
+    PendingCommands pendingCommands { 1024, 16 * 1024 * 1024 };
+    const bool legacyDispatch = SystemStats::getEnvironmentVariable ("JUCE_WEBVIEW_LEGACY_DISPATCH", "0") == "1";
+    const bool dispatchDiagnostics = SystemStats::getEnvironmentVariable ("JUCE_WEBVIEW_DISPATCH_DIAGNOSTICS", "0") == "1";
+    bool dispatchReported = false;
+    size_t legacyCommands = 0;
+    double legacyMaxWaitMs = 0, legacyTotalWaitMs = 0;
     bool webKitIsAvailable = false;
     bool childReapFailureReported = false;
     std::atomic<bool> transportFailed { false }, shuttingDown { false };

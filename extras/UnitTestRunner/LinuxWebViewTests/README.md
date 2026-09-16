@@ -37,3 +37,18 @@ obsolete resource IDs are exercised directly against the production registry.
 
 These tests validate the shared Linux WebView implementation. Plugin hosting,
 runtime-only installation, and UI performance require their separate checks.
+
+## Ordered dispatch candidate
+
+`linux-webview-dispatch-tests.cpp` is portable C++17 and exercises the production
+queue's byte/count limits, FIFO order, cancellation, two-instance isolation and
+100,000 deliveries across real producer/consumer threads, including rearming an
+empty queue. Compile with assertions enabled (no `NDEBUG`).
+
+The WebKit executable additionally sends 256 native events in one JavaScript
+burst and verifies order before subsequent evaluation results. Queued mode
+requires native listeners to run on the message thread and destroys the browser
+directly from a native listener, cancelling 64 trailing events. Set
+`JUCE_WEBVIEW_LEGACY_DISPATCH=1` to repeat the other lifecycle tests using the old
+reader/GUI-lock path. `JUCE_WEBVIEW_DISPATCH_DIAGNOSTICS=1` emits one summary per
+closed browser. These summaries do not measure browser rendering cadence.

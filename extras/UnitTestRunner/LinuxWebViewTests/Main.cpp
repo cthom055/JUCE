@@ -41,7 +41,7 @@ private:
         {
             if (! url.startsWith (getResourceProviderRoot()))
                 return;
-            // Linux command dispatch deliberately still uses the reader/MML.
+            // Keep the lifecycle test sequencing asynchronous in both dispatch modes.
             juce::MessageManager::callAsync (ready);
         }
     private:
@@ -92,7 +92,23 @@ private:
                                 if (message.contains ("child entry pid="))
                                     helperPid.store (message.fromFirstOccurrenceOf ("child entry pid=", false, false).getIntValue());
                             });
-        auto options = Options{}.withNativeIntegrationEnabled().withLinuxWebViewOptions (linuxOptions).withResourceProvider ([this] (const juce::String& path)
+        auto options = Options{}.withNativeIntegrationEnabled().withLinuxWebViewOptions (linuxOptions)
+            .withEventListener ("dispatchProbe", [this] (const juce::var& event)
+            {
+                if (! legacyDispatch)
+                    require (juce::MessageManager::getInstance()->isThisTheMessageThread(), "native events run on message thread");
+                require (int (event["index"]) == probeEvents++, "burst native events stay ordered");
+            })
+            .withEventListener ("destroyProbe", [this] (const juce::var&)
+            {
+                require (! legacyDispatch, "destruction probe only uses queued dispatch");
+                closeBrowser(); // Destroy directly inside the command batch.
+                phase = 8;
+            })
+            .withEventListener ("obsoleteProbe", [this] (const juce::var&)
+            {
+                require (false, "queued callbacks must not outlive browser");
+            }).withResourceProvider ([this] (const juce::String& path)
             -> std::optional<juce::WebBrowserComponent::Resource>
         {
             if (path == "/pending-resource")
@@ -136,6 +152,7 @@ private:
         if (phase == 0)
         {
             phase = 1;
+            browser->evaluateJavascript ("for(let i=0;i<256;++i) window.__JUCE__.backend.emitEvent('dispatchProbe',{index:i});");
             browser->evaluateJavascript ("globalThis.marker = 10");
             browser->evaluateJavascript ("41 + 1", [this] (auto result)
             {
@@ -179,6 +196,12 @@ private:
         else if (phase == 6)
         {
             phase = 7;
+            if (! legacyDispatch)
+            {
+                browser->evaluateJavascript ("window.__JUCE__.backend.emitEvent('destroyProbe',{});"
+                    "for(let i=0;i<64;++i) window.__JUCE__.backend.emitEvent('obsoleteProbe',{});");
+                return;
+            }
             browser->evaluateJavascript ("1", [this] (auto result)
             {
                 require (result.getResult() != nullptr && int (*result.getResult()) == 1, "repeated browser cycle result");
@@ -198,6 +221,7 @@ private:
         require (juce::MessageManager::getInstance()->isThisTheMessageThread(), "evaluation callback message thread");
         if (++completed != 4)
             return;
+        require (probeEvents == 256, "all burst events delivered before subsequent evaluation callbacks");
         browser->evaluateJavascript ("7", [this] (auto result)
         {
             require (result.getResult() != nullptr && int (*result.getResult()) == 7, "final result");
@@ -248,6 +272,8 @@ private:
     std::unique_ptr<Browser> browser;
     std::atomic<int> helperPid { 0 };
     std::atomic<bool> pendingResourceObserved { false };
+    const bool legacyDispatch = juce::SystemStats::getEnvironmentVariable ("JUCE_WEBVIEW_LEGACY_DISPATCH", "0") == "1";
+    int probeEvents = 0;
     int phase = 0, completed = 0;
     int repeatedCycles = 0, warmDescriptorCount = -1;
     bool failed = false;
