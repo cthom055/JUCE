@@ -47,8 +47,9 @@ empty queue. Compile with assertions enabled (no `NDEBUG`).
 
 The WebKit executable additionally sends 256 native events in one JavaScript
 burst and verifies order before subsequent evaluation results. Queued mode
-requires native listeners to run on the message thread and destroys the browser
-directly from a native listener, cancelling 64 trailing events. Set
+requires native listeners to run on the message thread. Existing lifecycle cases
+destroy the browser from an evaluation callback and with a resource response
+pending. Set
 `JUCE_WEBVIEW_LEGACY_DISPATCH=1` to repeat the other lifecycle tests using the old
 reader/GUI-lock path. `JUCE_WEBVIEW_DISPATCH_DIAGNOSTICS=1` emits one summary per
 closed browser. These summaries do not measure browser rendering cadence.

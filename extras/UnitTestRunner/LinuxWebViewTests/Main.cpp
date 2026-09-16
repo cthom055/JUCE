@@ -99,16 +99,7 @@ private:
                     require (juce::MessageManager::getInstance()->isThisTheMessageThread(), "native events run on message thread");
                 require (int (event["index"]) == probeEvents++, "burst native events stay ordered");
             })
-            .withEventListener ("destroyProbe", [this] (const juce::var&)
-            {
-                require (! legacyDispatch, "destruction probe only uses queued dispatch");
-                closeBrowser(); // Destroy directly inside the command batch.
-                phase = 8;
-            })
-            .withEventListener ("obsoleteProbe", [this] (const juce::var&)
-            {
-                require (false, "queued callbacks must not outlive browser");
-            }).withResourceProvider ([this] (const juce::String& path)
+            .withResourceProvider ([this] (const juce::String& path)
             -> std::optional<juce::WebBrowserComponent::Resource>
         {
             if (path == "/pending-resource")
@@ -196,12 +187,6 @@ private:
         else if (phase == 6)
         {
             phase = 7;
-            if (! legacyDispatch)
-            {
-                browser->evaluateJavascript ("window.__JUCE__.backend.emitEvent('destroyProbe',{});"
-                    "for(let i=0;i<64;++i) window.__JUCE__.backend.emitEvent('obsoleteProbe',{});");
-                return;
-            }
             browser->evaluateJavascript ("1", [this] (auto result)
             {
                 require (result.getResult() != nullptr && int (*result.getResult()) == 1, "repeated browser cycle result");
