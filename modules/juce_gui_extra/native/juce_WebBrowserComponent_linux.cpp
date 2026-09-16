@@ -43,6 +43,8 @@ struct WebKitURISchemeResponse;
 #include <cstring>
 #include <string>
 #include "juce_WebBrowserComponent_linux_helpers.h"
+#include "juce_WebBrowserComponent_resource_frame.h"
+#include "juce_WebBrowserComponent_transport_profile.h"
 
 namespace juce
 {
@@ -512,6 +514,8 @@ public:
 
         virtual void handleCommand (const String& cmd, const var& param) = 0;
         virtual void receiverHadError (const char* reason) = 0;
+        virtual void handleBinaryResource (int64, WebBrowserComponent::Resource) {}
+
     };
 
     enum class ReturnAfterMessageReceived
@@ -566,6 +570,20 @@ public:
                     return false;
 
                 const auto* jsonStart = buffer.data() + sizeof (size_t);
+                if (numBytesExpected > 0 && jsonStart[0] == 0)
+                {
+                    const auto frame = WebViewResourceFrame::decode (jsonStart, numBytesExpected);
+                    if (! frame) { fail ("invalid binary resource frame"); return true; }
+                    WebBrowserComponent::Resource resource;
+                    resource.mimeType = String::fromUTF8 (frame->mime, static_cast<int> (frame->mimeSize));
+                    resource.data.resize (frame->dataSize);
+                    if (frame->dataSize != 0) std::memcpy (resource.data.data(), frame->data, frame->dataSize);
+                    const auto id = frame->id;
+                    buffer.erase (buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t> (framedSize));
+                    if (responder != nullptr) responder->handleBinaryResource (id, std::move (resource));
+                    if (failed || ret == ReturnAfterMessageReceived::yes) return true;
+                    continue;
+                }
                 String json (CharPointer_UTF8 (jsonStart), CharPointer_UTF8 (jsonStart + numBytesExpected));
                 buffer.erase (buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t> (framedSize));
                 parseJSON (json);
@@ -601,6 +619,19 @@ public:
         }
     }
 
+    static bool sendResource (int outChannel, int64 id, const WebBrowserComponent::Resource& resource)
+    {
+        const auto payload = WebViewResourceFrame::encode (id, resource.mimeType.toStdString(),
+                                                          resource.data.data(), resource.data.size());
+        if (payload.empty()) return false;
+        const auto length = payload.size();
+        // Same ordered writer and outer framing as control commands. No new channel or locks.
+        std::vector<char> frame (sizeof (size_t) + length);
+        std::memcpy (frame.data(), &length, sizeof (size_t));
+        std::memcpy (frame.data() + sizeof (size_t), payload.data(), length);
+        return LinuxWebViewHelpers::writeAll (outChannel, frame.data(), frame.size());
+    }
+
     static bool sendCommand (int outChannel, const String& cmd, const var& params)
     {
         DynamicObject::Ptr obj = new DynamicObject;
@@ -610,7 +641,13 @@ public:
         if (! params.isVoid())
             obj->setProperty (getParamIdentifier(), params);
 
+        const auto begin = WebViewTransportProfile::now();
         auto json = JSON::toString (var (obj.get()));
+        if (WebViewTransportProfile::enabled())
+        {
+            static thread_local WebViewTransportProfile::Summary summary;
+            summary.add ("json-encode", WebViewTransportProfile::now() - begin, json.getNumBytesAsUTF8());
+        }
 
         auto jsonLength = static_cast<size_t> (json.getNumBytesAsUTF8());
         auto len        = sizeof (size_t) + jsonLength;
@@ -639,7 +676,13 @@ private:
 
     void parseJSON (StringRef json)
     {
+        const auto begin = WebViewTransportProfile::now();
         auto object = JSON::fromString (json);
+        if (WebViewTransportProfile::enabled())
+        {
+            static thread_local WebViewTransportProfile::Summary summary;
+            summary.add ("json-parse", WebViewTransportProfile::now() - begin);
+        }
 
         if (object.isObject() && object.hasProperty (getCmdIdentifier()))
         {
@@ -1150,9 +1193,17 @@ public:
 
     void handleResourceRequestedResponse (const var& params)
     {
-        auto& wk = *WebKitSymbols::getInstance();
+        deliverResourceResponse (FromVar::convert<ResourceRequestResponse> (params));
+    }
 
-        const auto response = FromVar::convert<ResourceRequestResponse> (params);
+    void handleBinaryResource (int64 id, WebBrowserComponent::Resource resource) override
+    {
+        deliverResourceResponse (ResourceRequestResponse { id, std::move (resource) });
+    }
+
+    void deliverResourceResponse (const std::optional<ResourceRequestResponse>& response)
+    {
+        auto& wk = *WebKitSymbols::getInstance();
 
         if (! response.has_value())
         {
@@ -1639,6 +1690,14 @@ public:
         }
 
         const auto response = browser.impl->handleResourceRequest (params->path);
+
+        if (response && response->mimeType == "application/vnd.solstice.bulk")
+        {
+            if (! transportFailed.load() && ! shuttingDown.load()
+                && ! CommandReceiver::sendResource (outChannel, params->requestId, *response))
+                receiverHadError ("binary resource write failed");
+            return;
+        }
 
         sendCommand (
                                       ResourceRequestResponse::key,
@@ -2233,10 +2292,17 @@ private:
 
     void handleCommand (const String& cmd, const var& params) override
     {
+        const auto begin = WebViewTransportProfile::now();
         const MessageManagerLock messageManagerLock (this);
-
+        const auto locked = WebViewTransportProfile::now();
         if (messageManagerLock.lockWasGained())
             handleCommandOnMessageThread (cmd, params);
+        if (WebViewTransportProfile::enabled())
+        {
+            static thread_local WebViewTransportProfile::Summary wait, dispatch;
+            wait.add ("gui-lock-wait", locked - begin);
+            dispatch.add ("dispatch", WebViewTransportProfile::now() - locked);
+        }
     }
 
     void receiverHadError (const char* reason) override
