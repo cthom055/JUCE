@@ -634,6 +634,16 @@ public:
     */
     void evaluateJavascript (const String& script, EvaluationCallback callback = nullptr);
 
+   #if JUCE_LINUX
+    /** Experimental display-only delivery from a non-real-time worker. Returns
+        false if busy/disconnected or the framed script exceeds PIPE_BUF. The
+        producer must retry the latest value and stop/join before destruction.
+        This does not acknowledge script execution; ordinary evaluations and
+        native commands must continue to use evaluateJavascript.
+    */
+    bool tryEvaluateJavascriptForDisplay (const String& script);
+   #endif
+
     /** Emits an object on the frontend under the specified eventId.
 
         Ids beginning with `__juce` are reserved for the framework implementation.

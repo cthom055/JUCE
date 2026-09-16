@@ -38,9 +38,11 @@ struct WebKitURISchemeResponse;
 #endif
 
 #include <dlfcn.h>
+#include <limits.h>
 #include <poll.h>
 #include <array>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include "juce_WebBrowserComponent_linux_helpers.h"
 #include "juce_WebBrowserComponent_linux_dispatch.h"
@@ -507,6 +509,14 @@ extern "C" int juce_gtkWebkitMain (int argc, const char* const* argv);
 class CommandReceiver
 {
 public:
+    enum class NonBlockingSendResult
+    {
+        sent,
+        wouldBlock,
+        tooLarge,
+        failed
+    };
+
     struct Responder
     {
         virtual ~Responder() = default;
@@ -606,6 +616,37 @@ public:
 
     static bool sendCommand (int outChannel, const String& cmd, const var& params)
     {
+        const auto buffer = serialiseCommand (cmd, params);
+        return LinuxWebViewHelpers::writeAll (outChannel, buffer.getData(), buffer.getSize());
+    }
+
+    static NonBlockingSendResult sendCommandNonBlocking (int outChannel, const String& cmd, const var& params)
+    {
+        const auto buffer = serialiseCommand (cmd, params);
+        if (buffer.getSize() > PIPE_BUF)
+            return NonBlockingSendResult::tooLarge;
+
+        const auto flags = fcntl (outChannel, F_GETFL);
+        if (flags < 0 || fcntl (outChannel, F_SETFL, flags | O_NONBLOCK) < 0)
+            return NonBlockingSendResult::failed;
+
+        // Frames fit PIPE_BUF: nonblocking writes are all-or-nothing. Reuse
+        // the scoped SIGPIPE guard so a dead helper cannot terminate the host.
+        const auto sent = LinuxWebViewHelpers::writeAll (outChannel, buffer.getData(), buffer.getSize());
+        const auto writeError = errno;
+        const auto restored = fcntl (outChannel, F_SETFL, flags) >= 0;
+        if (! restored)
+            return NonBlockingSendResult::failed;
+        if (sent)
+            return NonBlockingSendResult::sent;
+        if (! sent && (writeError == EAGAIN || writeError == EWOULDBLOCK))
+            return NonBlockingSendResult::wouldBlock;
+        return NonBlockingSendResult::failed;
+    }
+
+private:
+    static MemoryBlock serialiseCommand (const String& cmd, const var& params)
+    {
         DynamicObject::Ptr obj = new DynamicObject;
 
         obj->setProperty (getCmdIdentifier(), cmd);
@@ -618,18 +659,17 @@ public:
         auto jsonLength = static_cast<size_t> (json.getNumBytesAsUTF8());
         auto len        = sizeof (size_t) + jsonLength;
 
-        HeapBlock<char> buffer (len);
-        auto* dst = buffer.getData();
+        MemoryBlock buffer (len);
+        auto* dst = static_cast<char*> (buffer.getData());
 
         memcpy (dst, &jsonLength, sizeof (size_t));
         dst += sizeof (size_t);
 
         memcpy (dst, json.toRawUTF8(), jsonLength);
 
-        return LinuxWebViewHelpers::writeAll (outChannel, buffer.getData(), len);
+        return buffer;
     }
 
-private:
     void fail (const char* reason)
     {
         if (std::exchange (failed, true))
@@ -699,6 +739,33 @@ public:
             expectEquals (replies.commands.joinIntoString (","), String ("first,second"));
             expectEquals (replies.errors, 1);
             LinuxWebViewHelpers::closeDescriptor (descriptors[0]);
+        }
+
+        beginTest ("Non-blocking display commands are atomic and preserve framing");
+        {
+            int descriptors[2];
+            expectEquals (pipe (descriptors), 0);
+            Replies replies;
+            CommandReceiver receiver (&replies, descriptors[0]);
+            expect (CommandReceiver::sendCommandNonBlocking (descriptors[1], "display", {})
+                    == CommandReceiver::NonBlockingSendResult::sent);
+            receiver.tryNextRead (CommandReceiver::ReturnAfterMessageReceived::yes);
+            expectEquals (replies.commands.joinIntoString (","), String ("display"));
+            expectEquals (replies.errors, 0);
+
+            const String oversized (String::repeatedString ("x", PIPE_BUF));
+            expect (CommandReceiver::sendCommandNonBlocking (descriptors[1], "display", oversized)
+                    == CommandReceiver::NonBlockingSendResult::tooLarge);
+            const auto originalFlags = fcntl (descriptors[1], F_GETFL);
+            auto result = CommandReceiver::NonBlockingSendResult::sent;
+            for (int attempts = 0; attempts < 65536 && result == CommandReceiver::NonBlockingSendResult::sent; ++attempts)
+                result = CommandReceiver::sendCommandNonBlocking (descriptors[1], "display", {});
+            expect (result == CommandReceiver::NonBlockingSendResult::wouldBlock);
+            expectEquals (fcntl (descriptors[1], F_GETFL), originalFlags);
+            LinuxWebViewHelpers::closeDescriptor (descriptors[0]);
+            expect (CommandReceiver::sendCommandNonBlocking (descriptors[1], "display", {})
+                    == CommandReceiver::NonBlockingSendResult::failed);
+            LinuxWebViewHelpers::closeDescriptor (descriptors[1]);
         }
 
         beginTest ("Partial header survives until completed; truncated body fails once");
@@ -1599,8 +1666,7 @@ public:
         if (requireCallback)
             evaluationCallbacks.push_back (std::move (callback));
 
-        sendCommand ("evaluateJavascript",
-                     *ToVar::convert (EvaluateJavascriptParams { script, requireCallback }));
+        sendCommand ("evaluateJavascript", *ToVar::convert (EvaluateJavascriptParams { script, requireCallback }));
     }
 
     void handleJavascriptEvaluationCallback (const var& paramsIn)
@@ -1817,8 +1883,9 @@ public:
         // abandon the connection rather than blocking the host during teardown.
         if (connectionWasHealthy && outChannel >= 0)
         {
-            CommandReceiver::setBlocking (outChannel, false);
-            CommandReceiver::sendCommand (outChannel, "quit", {});
+            std::unique_lock lock (commandWriteMutex, std::try_to_lock);
+            if (lock.owns_lock())
+                CommandReceiver::sendCommandNonBlocking (outChannel, "quit", {});
         }
 
         // Terminating the helper also releases any in-flight blocking pipe write
@@ -1834,7 +1901,10 @@ public:
                 + " peak_queue=" + String (static_cast<int64> (stats.peakCount))
                 + " peak_bytes=" + String (static_cast<int64> (stats.peakBytes))
                 + " max_wait_ms=" + String (legacyDispatch ? legacyMaxWaitMs : stats.maxWaitMs, 3)
-                + " total_wait_ms=" + String (legacyDispatch ? legacyTotalWaitMs : stats.totalWaitMs, 3));
+                + " total_wait_ms=" + String (legacyDispatch ? legacyTotalWaitMs : stats.totalWaitMs, 3)
+                + " display_sent=" + String (static_cast<int64> (displayCommandsSent.load()))
+                + " display_dropped=" + String (static_cast<int64> (displayCommandsDropped.load()))
+                + " display_too_large=" + String (static_cast<int64> (displayCommandsTooLarge.load())));
         }
         receiver = nullptr;
         closeChannels();
@@ -1910,7 +1980,10 @@ private:
     {
         closeLogChannel();
         LinuxWebViewHelpers::closeDescriptor (inChannel);
-        LinuxWebViewHelpers::closeDescriptor (outChannel);
+        {
+            const std::scoped_lock lock (commandWriteMutex);
+            LinuxWebViewHelpers::closeDescriptor (outChannel);
+        }
         LinuxWebViewHelpers::closeDescriptor (threadControl[0]);
         LinuxWebViewHelpers::closeDescriptor (threadControl[1]);
         pfds.clear();
@@ -1921,10 +1994,50 @@ private:
         if (transportFailed.load() || shuttingDown.load())
             return false;
 
-        if (CommandReceiver::sendCommand (outChannel, command, params))
+        bool sent = false;
+        {
+            const std::scoped_lock lock (commandWriteMutex);
+            if (transportFailed.load() || shuttingDown.load())
+                return false;
+            sent = CommandReceiver::sendCommand (outChannel, command, params);
+        }
+
+        if (sent)
             return true;
 
         receiverHadError ("IPC write failed");
+        return false;
+    }
+
+    bool tryEvaluateJavascriptForDisplay (const String& script) override
+    {
+        // This explicit display-only API may be called by a non-RT producer.
+        // Returning false leaves retry/latest-value ownership with that producer.
+        if (transportFailed.load() || shuttingDown.load())
+            return false;
+        const auto params = *ToVar::convert (EvaluateJavascriptParams { script, false });
+        std::unique_lock lock (commandWriteMutex, std::try_to_lock);
+        if (! lock.owns_lock() || transportFailed.load() || shuttingDown.load())
+        {
+            displayCommandsDropped.fetch_add (1, std::memory_order_relaxed);
+            return false;
+        }
+        const auto result = CommandReceiver::sendCommandNonBlocking (outChannel, "evaluateJavascript", params);
+        switch (result)
+        {
+            case CommandReceiver::NonBlockingSendResult::sent:
+                displayCommandsSent.fetch_add (1, std::memory_order_relaxed);
+                return true;
+            case CommandReceiver::NonBlockingSendResult::wouldBlock:
+                displayCommandsDropped.fetch_add (1, std::memory_order_relaxed);
+                return false;
+            case CommandReceiver::NonBlockingSendResult::tooLarge:
+                displayCommandsTooLarge.fetch_add (1, std::memory_order_relaxed);
+                return false;
+            case CommandReceiver::NonBlockingSendResult::failed:
+                receiverHadError ("IPC display write failed");
+                return false;
+        }
         return false;
     }
 
@@ -2345,6 +2458,8 @@ private:
     bool webKitIsAvailable = false;
     bool childReapFailureReported = false;
     std::atomic<bool> transportFailed { false }, shuttingDown { false };
+    std::atomic<size_t> displayCommandsSent { 0 }, displayCommandsDropped { 0 }, displayCommandsTooLarge { 0 };
+    std::mutex commandWriteMutex;
 
     WebBrowserComponent& browser;
     String userAgent;

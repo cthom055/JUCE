@@ -423,9 +423,14 @@ public:
         const auto objectAsString = JSON::toString (object, true);
         const auto escaped = objectAsString.replace ("\\", "\\\\").replace ("'", "\\'");
 
+       #if JUCE_LINUX
+        static const auto requestResult = SystemStats::getEnvironmentVariable ("JUCE_WEBVIEW_EVENT_RESULTS", "0") == "1";
+       #else
+        constexpr auto requestResult = true;
+       #endif
         evaluateJavascript ("window.__JUCE__.backend.emitByBackend(" + eventId.toString().quoted() + ", "
                                 + escaped.quoted ('\'')
-                                + ");", evaluationHandler);
+                                + ");", requestResult ? evaluationHandler : EvaluationCallback{});
     }
 
     void goToURL (const String& url, const StringArray* headers, const MemoryBlock* postData)
@@ -463,6 +468,13 @@ public:
         platform->evaluateJavascript (script, std::move (callback));
     }
 
+   #if JUCE_LINUX
+    bool tryEvaluateJavascriptForDisplay (const String& script)
+    {
+        return platform->tryEvaluateJavascriptForDisplay (script);
+    }
+   #endif
+
     void setSize (int width, int height)
     {
         platform->setWebViewSize (width, height);
@@ -498,6 +510,9 @@ private:
         virtual void stop() = 0;
         virtual void refresh() = 0;
         virtual void evaluateJavascript (const String&, WebBrowserComponent::EvaluationCallback) = 0;
+       #if JUCE_LINUX
+        virtual bool tryEvaluateJavascriptForDisplay (const String&) { return false; }
+       #endif
         virtual void setWebViewSize (int, int) = 0;
         virtual void checkWindowAssociation() = 0;
 
@@ -717,6 +732,13 @@ void WebBrowserComponent::evaluateJavascript (const String& script, EvaluationCa
 {
     impl->evaluateJavascript (script, std::move (callback));
 }
+
+#if JUCE_LINUX
+bool WebBrowserComponent::tryEvaluateJavascriptForDisplay (const String& script)
+{
+    return impl->tryEvaluateJavascriptForDisplay (script);
+}
+#endif
 
 void WebBrowserComponent::focusGainedWithDirection (FocusChangeType type,
                                                     FocusChangeDirection direction)

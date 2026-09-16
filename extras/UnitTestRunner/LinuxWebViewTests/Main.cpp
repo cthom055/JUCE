@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <iostream>
 #include <sys/wait.h>
+#include <thread>
 
 class LinuxWebViewTests final : public juce::JUCEApplication, private juce::Timer
 {
@@ -143,6 +144,20 @@ private:
         if (phase == 0)
         {
             phase = 1;
+            // The caller deliberately does not service the JUCE message loop
+            // while this non-RT producer writes to WebKit.
+            bool displaySent = false;
+            std::thread displayProducer ([&]
+            {
+                displaySent = browser->tryEvaluateJavascriptForDisplay ("globalThis.displayProbe = 73");
+            });
+            displayProducer.join();
+            require (displaySent, "worker sends a display frame without message-loop service");
+            browser->evaluateJavascript ("globalThis.displayProbe", [this] (auto result)
+            {
+                require (result.getResult() != nullptr && int (*result.getResult()) == 73,
+                         "worker display frame executes before the following normal evaluation");
+            });
             browser->evaluateJavascript ("for(let i=0;i<256;++i) window.__JUCE__.backend.emitEvent('dispatchProbe',{index:i});");
             browser->evaluateJavascript ("globalThis.marker = 10");
             browser->evaluateJavascript ("41 + 1", [this] (auto result)
