@@ -483,6 +483,11 @@ public:
         platform->focusGainedWithDirection (type, dir);
     }
 
+    bool isHostInputProcessingEnabled() const noexcept
+    {
+        return platform->isHostInputProcessingEnabled();
+    }
+
     struct Platform;
 
 private:
@@ -503,6 +508,7 @@ private:
 
         virtual void focusGainedWithDirection (FocusChangeType, FocusChangeDirection) {}
         virtual void fallbackPaint (Graphics&) {}
+        virtual bool isHostInputProcessingEnabled() const noexcept { return false; }
     };
 
     static void makeFunctionsProviderIfNecessary (std::optional<NativeFunctionsProvider>& provider,
@@ -602,6 +608,11 @@ WebBrowserComponent::WebBrowserComponent (const Options& options)
 WebBrowserComponent::~WebBrowserComponent()
 {
     lifetimeListeners.call (&WebViewLifetimeListener::webViewDestructed, this);
+}
+
+bool WebBrowserComponent::isHostInputProcessingEnabled() const noexcept
+{
+    return impl->isHostInputProcessingEnabled();
 }
 
 void WebBrowserComponent::emitEventIfBrowserIsVisible (const Identifier& eventId, const var& object)

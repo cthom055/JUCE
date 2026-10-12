@@ -216,17 +216,26 @@ public:
                 return withMember (*this, &WinWebView2::backgroundColour, colour);
             }
 
+            /// Allows input to reach the host process before WebView2, when supported.
+            /// Disabled by default. Check isHostInputProcessingEnabled() after browser creation.
+            [[nodiscard]] WinWebView2 withAllowHostInputProcessing (bool allow = true) const
+            {
+                return withMember (*this, &WinWebView2::allowHostInputProcessing, allow);
+            }
+
             //==============================================================================
             File getDLLLocation() const                          { return dllLocation; }
             File getUserDataFolder() const                       { return userDataFolder; }
             bool getIsStatusBarDisabled() const noexcept         { return disableStatusBar; }
             bool getIsBuiltInErrorPageDisabled() const noexcept  { return disableBuiltInErrorPage; }
             Colour getBackgroundColour() const                   { return backgroundColour; }
+            bool getAllowHostInputProcessing() const noexcept    { return allowHostInputProcessing; }
 
         private:
             //==============================================================================
             File dllLocation, userDataFolder;
             bool disableStatusBar = false, disableBuiltInErrorPage = false;
+            bool allowHostInputProcessing = false;
             Colour backgroundColour;
         };
 
@@ -459,6 +468,10 @@ public:
     //==============================================================================
     /** Check if the specified options are supported on this platform. */
     static bool areOptionsSupported (const Options& options);
+
+    /// Returns whether this browser's WebView2 controller enabled host input processing.
+    /// Call on the message thread; false before creation, on fallback, or with other backends.
+    bool isHostInputProcessingEnabled() const noexcept;
 
     //==============================================================================
     /** Sends the browser to a particular URL.

@@ -497,6 +497,11 @@ public:
             checkWindowAssociation();
     }
 
+    bool isHostInputProcessingEnabled() const noexcept override
+    {
+        return hostInputProcessingEnabled;
+    }
+
     void focusGainedWithDirection (FocusChangeType, FocusChangeDirection direction) override
     {
         if (inMoveFocusRequested)
@@ -1055,12 +1060,53 @@ private:
             webView2ConstructionHelper.viewsWaitingForCreation.erase (this);
             webView2ConstructionHelper.webView2BeingCreated = this;
 
-            webViewHandle.environment->CreateCoreWebView2Controller ((HWND) peer->getNativeHandle(),
-                Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler> (
-                    [weakThis = WeakReference<WebView2> { this }] (HRESULT, ICoreWebView2Controller* controller) -> HRESULT
+            createWebViewController ((HWND) peer->getNativeHandle(),
+                                     preferences.getWinWebView2BackendOptions().getAllowHostInputProcessing());
+        }
+    }
+
+    void createWebViewController (HWND parentWindow, bool requestHostInputProcessing)
+    {
+        bool usingHostInputProcessing = false;
+
+       #if defined (__ICoreWebView2ControllerOptions4_INTERFACE_DEFINED__)
+        ComSmartPtr<ICoreWebView2Environment10> environment10;
+        ComSmartPtr<ICoreWebView2ControllerOptions> controllerOptions;
+
+        if (requestHostInputProcessing
+            && SUCCEEDED (webViewHandle.environment.QueryInterface (environment10))
+            && SUCCEEDED (environment10->CreateCoreWebView2ControllerOptions (controllerOptions.resetAndGetPointerAddress())))
+        {
+            ComSmartPtr<ICoreWebView2ControllerOptions4> controllerOptions4;
+
+            if (SUCCEEDED (controllerOptions.QueryInterface (controllerOptions4)))
+            {
+                BOOL enabled = FALSE;
+                usingHostInputProcessing = SUCCEEDED (controllerOptions4->put_AllowHostInputProcessing (TRUE))
+                                           && SUCCEEDED (controllerOptions4->get_AllowHostInputProcessing (&enabled))
+                                           && enabled != FALSE;
+            }
+        }
+       #else
+        ignoreUnused (requestHostInputProcessing);
+       #endif
+
+        auto completion = Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler> (
+                    [weakThis = WeakReference<WebView2> { this }, parentWindow, usingHostInputProcessing]
+                    (HRESULT result, ICoreWebView2Controller* controller) -> HRESULT
                     {
                         if (weakThis != nullptr)
                         {
+                            if (usingHostInputProcessing && (FAILED (result) || controller == nullptr))
+                            {
+                                if (controller != nullptr)
+                                    controller->Close();
+
+                                // Keep the serial-construction reservation while retrying without the option.
+                                weakThis->createWebViewController (parentWindow, false);
+                                return S_OK;
+                            }
+
                             weakThis->triggerAsyncUpdate();
                             webView2ConstructionHelper.webView2BeingCreated = nullptr;
 
@@ -1068,6 +1114,9 @@ private:
                             {
                                 weakThis->webViewController = ComSmartPtr (controller, IncrementRef::yes);
                                 controller->get_CoreWebView2 (weakThis->webView.resetAndGetPointerAddress());
+                                weakThis->hostInputProcessingEnabled = usingHostInputProcessing
+                                                                       && SUCCEEDED (result)
+                                                                       && weakThis->webView != nullptr;
 
                                 auto allUserScripts = weakThis->userScripts;
                                 allUserScripts.insert (0, platformSpecificIntegrationScript);
@@ -1135,12 +1184,27 @@ private:
                         }
 
                         return S_OK;
-                    }).Get());
-        }
+                    });
+
+        const auto result = [&]
+        {
+           #if defined (__ICoreWebView2ControllerOptions4_INTERFACE_DEFINED__)
+            if (usingHostInputProcessing)
+                return environment10->CreateCoreWebView2ControllerWithOptions (parentWindow, controllerOptions,
+                                                                               completion.Get());
+           #endif
+
+            return webViewHandle.environment->CreateCoreWebView2Controller (parentWindow, completion.Get());
+        }();
+
+        if (FAILED (result))
+            completion->Invoke (result, nullptr);
     }
 
     void closeWebView()
     {
+        hostInputProcessingEnabled = false;
+
         if (auto* webViewNativeWindow = AccessibilityHandler::getNativeChildForComponent (*this))
             webView2ConstructionHelper.associatedWebViewNativeWindows.erase (webViewNativeWindow);
 
@@ -1213,6 +1277,7 @@ private:
                            webMessageReceivedToken   { 0 };
 
     bool inMoveFocusRequested = false;
+    bool hostInputProcessingEnabled = false;
 
     struct URLRequest
     {
