@@ -207,8 +207,8 @@ struct WebViewKeyEquivalentResponder final : public ObjCClass<WebViewClass>
                          [] (id self, SEL selector)
                          {
                              const ObjCObjectHandle<id> keepViewAlive { [self retain] };
-                             const auto callback = copyInputFocusCallback (self);
                              const auto result = Base::template sendSuperclassMessage<BOOL> (self, selector);
+                             const auto callback = copyInputFocusCallback (self);
                              if (result && callback && [[self window] isKeyWindow])
                                  callback (true);
                              return result;
@@ -255,8 +255,8 @@ struct WebViewKeyEquivalentResponder final : public ObjCClass<WebViewClass>
                          [] (id self, SEL selector)
                          {
                             const ObjCObjectHandle<id> keepViewAlive { [self retain] };
-                            const auto callback = copyInputFocusCallback (self);
                             const auto result = Base::template sendSuperclassMessage<BOOL> (self, selector);
+                            const auto callback = copyInputFocusCallback (self);
                             const ScopeGuard notifyFocus { [callback, result]
                             {
                                 if (result && callback)
@@ -264,7 +264,8 @@ struct WebViewKeyEquivalentResponder final : public ObjCClass<WebViewClass>
                             } };
 
                             auto* focusChangeTypeHandle = getLastFocusChangeHandle (self);
-                            jassert (focusChangeTypeHandle != nullptr); // Forgot to call setLastFocusChangeHandle?
+                            if (focusChangeTypeHandle == nullptr)
+                                return result;
                             focusChangeTypeHandle->emplace (Component::FocusChangeDirection::unknown);
 
                             auto* currentEvent = [NSApp currentEvent];
@@ -977,6 +978,7 @@ public:
     {
        #if JUCE_MAC
         setInputFocusCallbackHandle (webView.get(), nullptr);
+        setLastFocusChangeHandle (webView.get(), nullptr);
         if (focusWindowObserver != nullptr)
             [NSNotificationCenter.defaultCenter removeObserver:focusWindowObserver.get()];
         focusWindowObserver.reset();
