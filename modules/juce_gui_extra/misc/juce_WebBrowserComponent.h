@@ -412,6 +412,13 @@ public:
             return copy;
         }
 
+        /// Reports native WebView input focus changes on Windows and macOS, on the message thread.
+        /// Empty by default. The callback receives true on focus entry and false on focus loss.
+        [[nodiscard]] Options withInputFocusCallback (std::function<void (bool)> callback) const
+        {
+            return withMember (*this, &Options::inputFocusCallback, std::move (callback));
+        }
+
         /** Adds all options provided by the builder to the returned Options object.
         */
         template <typename OptionsType>
@@ -434,6 +441,7 @@ public:
         auto        getResourceProvider() const                          { return resourceProvider; }
         const auto& getAllowedOrigin() const                             { return allowedOrigin; }
         const auto& getLifetimeListeners() const                         { return lifetimeListeners; }
+        const auto& getInputFocusCallback() const                        { return inputFocusCallback; }
 
     private:
         //==============================================================================
@@ -450,6 +458,7 @@ public:
         ResourceProvider resourceProvider;
         std::optional<String> allowedOrigin;
         std::vector<WebViewLifetimeListener*> lifetimeListeners;
+        std::function<void (bool)> inputFocusCallback;
     };
 
     //==============================================================================
