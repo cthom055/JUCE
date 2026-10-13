@@ -216,17 +216,26 @@ public:
                 return withMember (*this, &WinWebView2::backgroundColour, colour);
             }
 
+            /// Allows input to reach the host process before WebView2, when supported.
+            /// Disabled by default. Check isHostInputProcessingEnabled() after browser creation.
+            [[nodiscard]] WinWebView2 withAllowHostInputProcessing (bool allow = true) const
+            {
+                return withMember (*this, &WinWebView2::allowHostInputProcessing, allow);
+            }
+
             //==============================================================================
             File getDLLLocation() const                          { return dllLocation; }
             File getUserDataFolder() const                       { return userDataFolder; }
             bool getIsStatusBarDisabled() const noexcept         { return disableStatusBar; }
             bool getIsBuiltInErrorPageDisabled() const noexcept  { return disableBuiltInErrorPage; }
             Colour getBackgroundColour() const                   { return backgroundColour; }
+            bool getAllowHostInputProcessing() const noexcept    { return allowHostInputProcessing; }
 
         private:
             //==============================================================================
             File dllLocation, userDataFolder;
             bool disableStatusBar = false, disableBuiltInErrorPage = false;
+            bool allowHostInputProcessing = false;
             Colour backgroundColour;
         };
 
@@ -403,6 +412,13 @@ public:
             return copy;
         }
 
+        /// Reports native WebView input focus changes on Windows and macOS, on the message thread.
+        /// Empty by default. The callback receives true on focus entry and false on focus loss.
+        [[nodiscard]] Options withInputFocusCallback (std::function<void (bool)> callback) const
+        {
+            return withMember (*this, &Options::inputFocusCallback, std::move (callback));
+        }
+
         /** Adds all options provided by the builder to the returned Options object.
         */
         template <typename OptionsType>
@@ -425,6 +441,7 @@ public:
         auto        getResourceProvider() const                          { return resourceProvider; }
         const auto& getAllowedOrigin() const                             { return allowedOrigin; }
         const auto& getLifetimeListeners() const                         { return lifetimeListeners; }
+        const auto& getInputFocusCallback() const                        { return inputFocusCallback; }
 
     private:
         //==============================================================================
@@ -441,6 +458,7 @@ public:
         ResourceProvider resourceProvider;
         std::optional<String> allowedOrigin;
         std::vector<WebViewLifetimeListener*> lifetimeListeners;
+        std::function<void (bool)> inputFocusCallback;
     };
 
     //==============================================================================
@@ -459,6 +477,10 @@ public:
     //==============================================================================
     /** Check if the specified options are supported on this platform. */
     static bool areOptionsSupported (const Options& options);
+
+    /// Returns whether this browser's WebView2 controller enabled host input processing.
+    /// Call on the message thread; false before creation, on fallback, or with other backends.
+    bool isHostInputProcessingEnabled() const noexcept;
 
     //==============================================================================
     /** Sends the browser to a particular URL.

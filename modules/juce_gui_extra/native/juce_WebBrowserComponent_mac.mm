@@ -165,6 +165,21 @@ static var fromObject (id object)
 using LastFocusChange = std::optional<Component::FocusChangeDirection>;
 
 static const char* lastFocusChangeMemberName = "lastFocusChangeHandle";
+using InputFocusCallback = std::function<void (bool)>;
+static const char* inputFocusCallbackMemberName = "inputFocusCallbackHandle";
+
+[[maybe_unused]] static void setInputFocusCallbackHandle (id instance, InputFocusCallback* callback)
+{
+    object_setInstanceVariable (instance, inputFocusCallbackMemberName, callback);
+}
+
+[[maybe_unused]] static InputFocusCallback copyInputFocusCallback (id instance)
+{
+    if (auto* callback = getIvar<InputFocusCallback*> (instance, inputFocusCallbackMemberName))
+        return *callback;
+
+    return {};
+}
 
 [[maybe_unused]] static void setLastFocusChangeHandle (id instance, LastFocusChange* object)
 {
@@ -186,6 +201,18 @@ struct WebViewKeyEquivalentResponder final : public ObjCClass<WebViewClass>
         : Base ("WebViewKeyEquivalentResponder_")
     {
         this->template addIvar<LastFocusChange*> (lastFocusChangeMemberName);
+        this->template addIvar<InputFocusCallback*> (inputFocusCallbackMemberName);
+
+        this->addMethod (@selector (becomeFirstResponder),
+                         [] (id self, SEL selector)
+                         {
+                             const ObjCObjectHandle<id> keepViewAlive { [self retain] };
+                             const auto result = Base::template sendSuperclassMessage<BOOL> (self, selector);
+                             const auto callback = copyInputFocusCallback (self);
+                             if (result && callback && [[self window] isKeyWindow])
+                                 callback (true);
+                             return result;
+                         });
 
         this->addMethod (@selector (performKeyEquivalent:),
                          [] (id self, SEL selector, NSEvent* event)
@@ -227,10 +254,18 @@ struct WebViewKeyEquivalentResponder final : public ObjCClass<WebViewClass>
         this->addMethod (@selector (resignFirstResponder),
                          [] (id self, SEL selector)
                          {
+                            const ObjCObjectHandle<id> keepViewAlive { [self retain] };
                             const auto result = Base::template sendSuperclassMessage<BOOL> (self, selector);
+                            const auto callback = copyInputFocusCallback (self);
+                            const ScopeGuard notifyFocus { [callback, result]
+                            {
+                                if (result && callback)
+                                    callback (false);
+                            } };
 
                             auto* focusChangeTypeHandle = getLastFocusChangeHandle (self);
-                            jassert (focusChangeTypeHandle != nullptr); // Forgot to call setLastFocusChangeHandle?
+                            if (focusChangeTypeHandle == nullptr)
+                                return result;
                             focusChangeTypeHandle->emplace (Component::FocusChangeDirection::unknown);
 
                             auto* currentEvent = [NSApp currentEvent];
@@ -901,6 +936,29 @@ public:
                                                       configuration: config.get()]);
 
         setLastFocusChangeHandle (webView.get(), &lastFocusChange);
+        inputFocusCallback = browserOptions.getInputFocusCallback();
+        setInputFocusCallbackHandle (webView.get(), &inputFocusCallback);
+        if (inputFocusCallback)
+        {
+            const Component::SafePointer<WKWebViewImpl> safeThis (this);
+            focusWindowObserver.reset ([[NSNotificationCenter.defaultCenter
+                addObserverForName:NSWindowDidBecomeKeyNotification
+                            object:nil
+                             queue:nil
+                        usingBlock:^(NSNotification* notification)
+                        {
+                            if (safeThis == nullptr)
+                                return;
+                            auto* nativeView = safeThis->webView.get();
+                            auto* window = [nativeView window];
+                            if (window == nil || notification.object != window || !window.isKeyWindow
+                                || window.firstResponder != nativeView)
+                                return;
+                            const auto callback = copyInputFocusCallback (nativeView);
+                            if (callback)
+                                callback (true);
+                        }] retain]);
+        }
        #else
         webView.reset ([[WKWebView alloc] initWithFrame: CGRectMake (0, 0, 100.0f, 100.0f)
                                           configuration: config.get()]);
@@ -918,6 +976,13 @@ public:
 
     ~WKWebViewImpl() override
     {
+       #if JUCE_MAC
+        setInputFocusCallbackHandle (webView.get(), nullptr);
+        setLastFocusChangeHandle (webView.get(), nullptr);
+        if (focusWindowObserver != nullptr)
+            [NSNotificationCenter.defaultCenter removeObserver:focusWindowObserver.get()];
+        focusWindowObserver.reset();
+       #endif
         WebViewDelegateClass::setConnector (webViewDelegate.get(), nullptr);
 
         setView (nil);
@@ -1151,6 +1216,10 @@ private:
     DelegateConnector delegateConnector;
     bool allowAccessToEnclosingDirectory = false;
     LastFocusChange lastFocusChange;
+   #if JUCE_MAC
+    InputFocusCallback inputFocusCallback;
+    ObjCObjectHandle<id> focusWindowObserver;
+   #endif
     ObjCObjectHandle<WKWebView*> webView;
     ObjCObjectHandle<id> webViewDelegate;
     String lastRequestedUrl, lastLoadedUrl;

@@ -497,6 +497,11 @@ public:
             checkWindowAssociation();
     }
 
+    bool isHostInputProcessingEnabled() const noexcept override
+    {
+        return hostInputProcessingEnabled;
+    }
+
     void focusGainedWithDirection (FocusChangeType, FocusChangeDirection direction) override
     {
         if (inMoveFocusRequested)
@@ -926,6 +931,30 @@ private:
 
         if (webViewController != nullptr)
         {
+            if (preferences.getInputFocusCallback())
+            {
+                const auto notify = [weakThis = WeakReference<WebView2> { this }] (bool focused)
+                {
+                    if (weakThis != nullptr)
+                        if (const auto callback = weakThis->preferences.getInputFocusCallback())
+                            callback (focused);
+                };
+
+                webViewController->add_GotFocus (Callback<ICoreWebView2FocusChangedEventHandler> (
+                    [notify] (ICoreWebView2Controller*, IUnknown*) -> HRESULT
+                    {
+                        notify (true);
+                        return S_OK;
+                    }).Get(), &gotFocusToken);
+
+                webViewController->add_LostFocus (Callback<ICoreWebView2FocusChangedEventHandler> (
+                    [notify] (ICoreWebView2Controller*, IUnknown*) -> HRESULT
+                    {
+                        notify (false);
+                        return S_OK;
+                    }).Get(), &lostFocusToken);
+            }
+
             webViewController->add_MoveFocusRequested (Callback<ICoreWebView2MoveFocusRequestedEventHandler> (
                 [this] (ICoreWebView2Controller*, ICoreWebView2MoveFocusRequestedEventArgs* args) -> HRESULT
                 {
@@ -994,6 +1023,12 @@ private:
         {
             if (moveFocusRequestedToken.value != 0)
                 webViewController->remove_MoveFocusRequested (moveFocusRequestedToken);
+
+            if (gotFocusToken.value != 0)
+                webViewController->remove_GotFocus (gotFocusToken);
+
+            if (lostFocusToken.value != 0)
+                webViewController->remove_LostFocus (lostFocusToken);
         }
     }
 
@@ -1046,7 +1081,7 @@ private:
             // logic can work. Multiple HWNDs can belong to the same browser process, so the only
             // way to identify which belongs to which WebView2 is to associate them with each other
             // in the order of creation.
-            if (webView2ConstructionHelper.webView2BeingCreated != nullptr)
+            if (webView2ConstructionHelper.controllerCreationPending)
             {
                 webView2ConstructionHelper.viewsWaitingForCreation.insert (this);
                 return;
@@ -1054,20 +1089,80 @@ private:
 
             webView2ConstructionHelper.viewsWaitingForCreation.erase (this);
             webView2ConstructionHelper.webView2BeingCreated = this;
+            webView2ConstructionHelper.controllerCreationPending = true;
 
-            webViewHandle.environment->CreateCoreWebView2Controller ((HWND) peer->getNativeHandle(),
-                Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler> (
-                    [weakThis = WeakReference<WebView2> { this }] (HRESULT, ICoreWebView2Controller* controller) -> HRESULT
+            createWebViewController ((HWND) peer->getNativeHandle(),
+                                     preferences.getWinWebView2BackendOptions().getAllowHostInputProcessing());
+        }
+    }
+
+    void createWebViewController (HWND parentWindow, bool requestHostInputProcessing)
+    {
+        bool usingHostInputProcessing = false;
+
+       #if defined (__ICoreWebView2ControllerOptions4_INTERFACE_DEFINED__)
+        ComSmartPtr<ICoreWebView2Environment10> environment10;
+        ComSmartPtr<ICoreWebView2ControllerOptions> controllerOptions;
+
+        if (requestHostInputProcessing
+            && SUCCEEDED (webViewHandle.environment.QueryInterface (environment10))
+            && SUCCEEDED (environment10->CreateCoreWebView2ControllerOptions (controllerOptions.resetAndGetPointerAddress())))
+        {
+            ComSmartPtr<ICoreWebView2ControllerOptions4> controllerOptions4;
+
+            if (SUCCEEDED (controllerOptions.QueryInterface (controllerOptions4)))
+            {
+                BOOL enabled = FALSE;
+                usingHostInputProcessing = SUCCEEDED (controllerOptions4->put_AllowHostInputProcessing (TRUE))
+                                           && SUCCEEDED (controllerOptions4->get_AllowHostInputProcessing (&enabled))
+                                           && enabled != FALSE;
+            }
+        }
+       #else
+        ignoreUnused (requestHostInputProcessing);
+       #endif
+
+        auto completion = Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler> (
+                    [weakThis = WeakReference<WebView2> { this }, parentWindow, usingHostInputProcessing]
+                    (HRESULT result, ICoreWebView2Controller* controller) -> HRESULT
                     {
+                        if (weakThis == nullptr)
+                        {
+                            webView2ConstructionHelper.webView2BeingCreated = nullptr;
+                            webView2ConstructionHelper.controllerCreationPending = false;
+
+                            if (controller != nullptr)
+                                controller->Close();
+
+                            if (! webView2ConstructionHelper.viewsWaitingForCreation.empty())
+                                (*webView2ConstructionHelper.viewsWaitingForCreation.begin())->triggerAsyncUpdate();
+
+                            return S_OK;
+                        }
+
                         if (weakThis != nullptr)
                         {
+                            if (usingHostInputProcessing && (FAILED (result) || controller == nullptr))
+                            {
+                                if (controller != nullptr)
+                                    controller->Close();
+
+                                // Keep the serial-construction reservation while retrying without the option.
+                                weakThis->createWebViewController (parentWindow, false);
+                                return S_OK;
+                            }
+
                             weakThis->triggerAsyncUpdate();
                             webView2ConstructionHelper.webView2BeingCreated = nullptr;
+                            webView2ConstructionHelper.controllerCreationPending = false;
 
                             if (controller != nullptr)
                             {
                                 weakThis->webViewController = ComSmartPtr (controller, IncrementRef::yes);
                                 controller->get_CoreWebView2 (weakThis->webView.resetAndGetPointerAddress());
+                                weakThis->hostInputProcessingEnabled = usingHostInputProcessing
+                                                                       && SUCCEEDED (result)
+                                                                       && weakThis->webView != nullptr;
 
                                 auto allUserScripts = weakThis->userScripts;
                                 allUserScripts.insert (0, platformSpecificIntegrationScript);
@@ -1135,12 +1230,27 @@ private:
                         }
 
                         return S_OK;
-                    }).Get());
-        }
+                    });
+
+        const auto result = [&]
+        {
+           #if defined (__ICoreWebView2ControllerOptions4_INTERFACE_DEFINED__)
+            if (usingHostInputProcessing)
+                return environment10->CreateCoreWebView2ControllerWithOptions (parentWindow, controllerOptions,
+                                                                               completion.Get());
+           #endif
+
+            return webViewHandle.environment->CreateCoreWebView2Controller (parentWindow, completion.Get());
+        }();
+
+        if (FAILED (result))
+            completion->Invoke (result, nullptr);
     }
 
     void closeWebView()
     {
+        hostInputProcessingEnabled = false;
+
         if (auto* webViewNativeWindow = AccessibilityHandler::getNativeChildForComponent (*this))
             webView2ConstructionHelper.associatedWebViewNativeWindows.erase (webViewNativeWindow);
 
@@ -1210,9 +1320,12 @@ private:
                            navigationCompletedToken  { 0 },
                            webResourceRequestedToken { 0 },
                            moveFocusRequestedToken   { 0 },
+                           gotFocusToken             { 0 },
+                           lostFocusToken            { 0 },
                            webMessageReceivedToken   { 0 };
 
     bool inMoveFocusRequested = false;
+    bool hostInputProcessingEnabled = false;
 
     struct URLRequest
     {
@@ -1226,6 +1339,8 @@ private:
     struct WebView2ConstructionHelper
     {
         WebView2* webView2BeingCreated;
+        // A destroyed owner must not allow overlapping asynchronous controller creations.
+        bool controllerCreationPending = false;
         std::set<WebView2*> viewsWaitingForCreation;
         std::set<void*> associatedWebViewNativeWindows;
     };
