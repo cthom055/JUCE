@@ -159,6 +159,7 @@ namespace Ids
     DECLARE_ID (msvcModuleDefinitionFile);
     DECLARE_ID (bigIcon);
     DECLARE_ID (smallIcon);
+    DECLARE_ID (iconComposerIcon);
     DECLARE_ID (prebuildCommand);
     DECLARE_ID (postbuildCommand);
     DECLARE_ID (useRuntimeLibDLL);
@@ -368,6 +369,7 @@ namespace Ids
     DECLARE_ID (pluginProducesMidiOut);
     DECLARE_ID (pluginIsMidiEffectPlugin);
     DECLARE_ID (pluginEditorRequiresKeys);
+    DECLARE_ID (pluginLV2PluginClass);
     DECLARE_ID (pluginVSTCategory);
     DECLARE_ID (pluginVST3Category);
     DECLARE_ID (pluginAUExportPrefix);
@@ -399,7 +401,10 @@ namespace Ids
     DECLARE_ID (lv2Uri);
     DECLARE_ID (lv2UriUi);
     DECLARE_ID (lv2BinaryLocation);
-    DECLARE_ID (vst3ManifestEnabled);
+    DECLARE_ID (paceProtectionEnabled);
+    DECLARE_ID (paceConfigurationLocation);
+    DECLARE_ID (paceBuildSourceRootFolder);
+    DECLARE_ID (paceUsingSharableTargetNames);
 
     DECLARE_ID (osxSDK);
     DECLARE_ID (osxCompatibility);

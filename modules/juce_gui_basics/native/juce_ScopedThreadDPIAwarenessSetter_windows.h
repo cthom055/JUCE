@@ -36,7 +36,7 @@ namespace juce
 {
 
 //==============================================================================
-class ScopedThreadDPIAwarenessSetter
+class [[nodiscard]] ScopedThreadDPIAwarenessSetter
 {
 public:
     explicit ScopedThreadDPIAwarenessSetter (void* nativeWindow);
@@ -44,8 +44,9 @@ public:
     ScopedThreadDPIAwarenessSetter& operator= (ScopedThreadDPIAwarenessSetter&&) noexcept;
     ~ScopedThreadDPIAwarenessSetter();
 
-private:
     class NativeImpl;
+
+private:
     std::unique_ptr<NativeImpl> pimpl;
 
     JUCE_LEAK_DETECTOR (ScopedThreadDPIAwarenessSetter)

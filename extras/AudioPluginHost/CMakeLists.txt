@@ -33,8 +33,11 @@
 juce_add_gui_app(AudioPluginHost
     BUNDLE_ID                       com.juce.pluginhost
     ICON_BIG                        "${CMAKE_CURRENT_SOURCE_DIR}/Source/JUCEAppIcon.png"
+    ICON_COMPOSER_BUNDLE            "${CMAKE_CURRENT_SOURCE_DIR}/Source/AppIcon.icon"
     MICROPHONE_PERMISSION_ENABLED   TRUE
-    PLUGINHOST_AU                   TRUE)
+    PLUGINHOST_AU                   TRUE
+    NEEDS_WEB_BROWSER               FALSE
+    NEEDS_CURL                      FALSE)
 
 juce_generate_juce_header(AudioPluginHost)
 
@@ -57,6 +60,7 @@ juce_add_binary_data(AudioPluginHostData SOURCES
 
 target_compile_definitions(AudioPluginHost PRIVATE
     JUCE_ALSA=1
+    JUCE_ASIO=1
     JUCE_CONTENT_SHARING=1
     JUCE_DIRECTSOUND=1
     JUCE_DISABLE_CAUTIOUS_PARAMETER_ID_CHECKING=1
