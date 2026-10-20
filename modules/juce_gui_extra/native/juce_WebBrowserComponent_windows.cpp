@@ -1123,7 +1123,8 @@ private:
        #endif
 
         auto completion = Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler> (
-                    [weakThis = WeakReference<WebView2> { this }, parentWindow, usingHostInputProcessing]
+                    [weakThis = WeakReference<WebView2> { this }, parentWindow, usingHostInputProcessing,
+                     contextBeforeWebViewCreation = GetThreadDpiAwarenessContext()]
                     (HRESULT result, ICoreWebView2Controller* controller) -> HRESULT
                     {
                         if (weakThis == nullptr)
@@ -1142,6 +1143,8 @@ private:
 
                         if (weakThis != nullptr)
                         {
+                            SetThreadDpiAwarenessContext (contextBeforeWebViewCreation);
+
                             if (usingHostInputProcessing && (FAILED (result) || controller == nullptr))
                             {
                                 if (controller != nullptr)
