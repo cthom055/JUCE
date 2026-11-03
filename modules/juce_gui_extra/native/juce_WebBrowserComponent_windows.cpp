@@ -1341,9 +1341,11 @@ private:
 
     struct WebView2ConstructionHelper
     {
+        WebView2ConstructionHelper() : controllerCreationPending (false) {}
+
         WebView2* webView2BeingCreated;
         // A destroyed owner must not allow overlapping asynchronous controller creations.
-        bool controllerCreationPending = false;
+        bool controllerCreationPending;
         std::set<WebView2*> viewsWaitingForCreation;
         std::set<void*> associatedWebViewNativeWindows;
     };
