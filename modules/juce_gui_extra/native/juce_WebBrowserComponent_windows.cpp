@@ -1061,6 +1061,20 @@ private:
             settings->put_IsStatusBarEnabled (! preferences.getWinWebView2BackendOptions().getIsStatusBarDisabled());
             settings->put_IsBuiltInErrorPageEnabled (! preferences.getWinWebView2BackendOptions().getIsBuiltInErrorPageDisabled());
 
+            if (preferences.getWinWebView2BackendOptions().getIsUserZoomDisabled())
+            {
+                settings->put_IsZoomControlEnabled (FALSE);
+                webViewController->put_ZoomFactor (1.0);
+
+               #if defined (__ICoreWebView2Settings5_INTERFACE_DEFINED__)
+                ComSmartPtr<ICoreWebView2Settings5> settings5;
+                settings.QueryInterface (settings5);
+
+                if (settings5 != nullptr)
+                    settings5->put_IsPinchZoomEnabled (FALSE);
+               #endif
+            }
+
             if (userAgent.isNotEmpty())
             {
                 ComSmartPtr<ICoreWebView2Settings2> settings2;
