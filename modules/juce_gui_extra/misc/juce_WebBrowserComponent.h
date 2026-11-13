@@ -223,6 +223,12 @@ public:
                 return withMember (*this, &WinWebView2::allowHostInputProcessing, allow);
             }
 
+            /// Disables browser and pinch zoom without changing Windows DPI scaling.
+            [[nodiscard]] WinWebView2 withUserZoomDisabled() const
+            {
+                return withMember (*this, &WinWebView2::disableUserZoom, true);
+            }
+
             //==============================================================================
             File getDLLLocation() const                          { return dllLocation; }
             File getUserDataFolder() const                       { return userDataFolder; }
@@ -230,12 +236,14 @@ public:
             bool getIsBuiltInErrorPageDisabled() const noexcept  { return disableBuiltInErrorPage; }
             Colour getBackgroundColour() const                   { return backgroundColour; }
             bool getAllowHostInputProcessing() const noexcept    { return allowHostInputProcessing; }
+            bool getIsUserZoomDisabled() const noexcept          { return disableUserZoom; }
 
         private:
             //==============================================================================
             File dllLocation, userDataFolder;
             bool disableStatusBar = false, disableBuiltInErrorPage = false;
             bool allowHostInputProcessing = false;
+            bool disableUserZoom = false;
             Colour backgroundColour;
         };
 
