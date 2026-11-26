@@ -114,6 +114,11 @@ public:
     */
     using ResourceProvider = std::function<std::optional<Resource> (const String&)>;
 
+    /** The type used in Options::withFileDropHandler. Receives the full paths of the dropped
+        files, on the message thread.
+    */
+    using FileDropHandler = std::function<void (const StringArray&)>;
+
     //==============================================================================
     /**
         Options to configure WebBrowserComponent.
@@ -400,6 +405,19 @@ public:
             return copy;
         }
 
+        /** Receives the paths of files dropped onto the page.
+
+            The page still decides whether a drop is allowed: WebKit only completes a drop when the
+            page's dragover handler calls preventDefault(). The page also receives its usual drop
+            event, but browsers don't expose file paths to it, so use this to load files natively.
+
+            Currently implemented for the macOS WKWebView backend only.
+        */
+        [[nodiscard]] Options withFileDropHandler (FileDropHandler handler) const
+        {
+            return withMember (*this, &Options::fileDropHandler, std::move (handler));
+        }
+
         /** Adds a Javascript code that will be evaluated before any other resource is loaded but
             after the JUCE backend definitions become available, hence the specified script can
             rely on the presence of `window.__JUCE__.backend`.
@@ -489,6 +507,7 @@ public:
         auto        getResourceProvider() const                          { return resourceProvider; }
         const auto& getAllowedOrigin() const                             { return allowedOrigin; }
         const auto& getLifetimeListeners() const                         { return lifetimeListeners; }
+        const auto& getFileDropHandler() const                           { return fileDropHandler; }
 
     private:
         //==============================================================================
@@ -506,6 +525,7 @@ public:
         ResourceProvider resourceProvider;
         std::optional<String> allowedOrigin;
         std::vector<WebViewLifetimeListener*> lifetimeListeners;
+        FileDropHandler fileDropHandler;
     };
 
     //==============================================================================
@@ -650,6 +670,21 @@ public:
         @endcode
     */
     void emitEventIfBrowserIsVisible (const Identifier& eventId, const var& object);
+
+    /** Starts dragging files out of the browser, e.g. to the desktop or into a host application.
+
+        Call this while the mouse button that is pressed on the page is still down, typically from
+        a native function or event listener invoked by the page's pointermove handler. The page
+        should stop the browser's own dragging for the pressed element (e.g. with
+        `-webkit-user-drag: none`), so the two don't compete.
+
+        onFinished is called on the message thread when the drag ends, whether or not the files
+        were dropped anywhere.
+
+        Returns false if no drag could be started: if the mouse button isn't down, or the backend
+        doesn't support it. Currently implemented for the macOS WKWebView backend only.
+    */
+    bool startExternalFileDrag (const StringArray& files, std::function<void()> onFinished = nullptr);
 
     //==============================================================================
     /** This callback is called when the browser is about to navigate

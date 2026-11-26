@@ -484,6 +484,11 @@ public:
         platform->focusGainedWithDirection (type, dir);
     }
 
+    bool startExternalFileDrag (const StringArray& files, std::function<void()> onFinished)
+    {
+        return platform->startExternalFileDrag (files, std::move (onFinished));
+    }
+
     struct Platform;
 
 private:
@@ -504,6 +509,7 @@ private:
 
         virtual void focusGainedWithDirection (FocusChangeType, FocusChangeDirection) {}
         virtual void fallbackPaint (Graphics&) {}
+        virtual bool startExternalFileDrag (const StringArray&, std::function<void()>) { return false; }
     };
 
     static void makeFunctionsProviderIfNecessary (std::optional<NativeFunctionsProvider>& provider,
@@ -609,6 +615,14 @@ void WebBrowserComponent::emitEventIfBrowserIsVisible (const Identifier& eventId
 {
     if (isVisible())
         impl->emitEvent (eventId, object);
+}
+
+bool WebBrowserComponent::startExternalFileDrag (const StringArray& files, std::function<void()> onFinished)
+{
+    if (files.isEmpty())
+        return false;
+
+    return impl->startExternalFileDrag (files, std::move (onFinished));
 }
 
 const String& WebBrowserComponent::getResourceProviderRoot()

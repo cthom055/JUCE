@@ -177,6 +177,110 @@ static const char* lastFocusChangeMemberName = "lastFocusChangeHandle";
 }
 
 #if JUCE_MAC
+// What the WKWebView subclass needs for dragging files in and out. Owned by WKWebViewImpl.
+struct WebViewFileDragState
+{
+    WebBrowserComponent::FileDropHandler onFileDrop;
+    // The latest left-button press or drag on the view, retained: a drag session must start from one.
+    ObjCObjectHandle<NSEvent*> lastMouseEvent;
+};
+
+static const char* fileDragStateMemberName = "fileDragStateHandle";
+
+static void setFileDragStateHandle (id instance, WebViewFileDragState* object)
+{
+    object_setInstanceVariable (instance, fileDragStateMemberName, object);
+}
+
+static WebViewFileDragState* getFileDragStateHandle (id instance)
+{
+    return getIvar<WebViewFileDragState*> (instance, fileDragStateMemberName);
+}
+
+static void rememberMouseEvent (id self, NSEvent* event)
+{
+    if (auto* state = getFileDragStateHandle (self))
+        state->lastMouseEvent.reset ([event retain]);
+}
+
+// Ends a file drag started by WKWebViewImpl::startExternalFileDrag.
+class WebViewFileDragSource final : public ObjCClass<NSObject<NSDraggingSource>>
+{
+public:
+    struct DataMembers
+    {
+        ObjCObjectHandle<NSView*> view;
+        std::function<void()> onFinished;
+    };
+
+    static auto* create (DataMembers members)
+    {
+        static WebViewFileDragSource fileDragSource;
+        auto* result = [[fileDragSource.createInstance() init] autorelease];
+        object_setInstanceVariable (result, "members", new DataMembers (std::move (members)));
+        return result;
+    }
+
+private:
+    static DataMembers* getMembers (id self)
+    {
+        return getIvar<DataMembers*> (self, "members");
+    }
+
+    WebViewFileDragSource()
+        : ObjCClass ("JUCEWebViewFileDragSource_")
+    {
+        addIvar<DataMembers*> ("members");
+
+        addMethod (@selector (dealloc), [] (id self, SEL)
+        {
+            delete getMembers (self);
+            sendSuperclassMessage<void> (self, @selector (dealloc));
+        });
+
+        addMethod (@selector (draggingSession:sourceOperationMaskForDraggingContext:),
+                   [] (id, SEL, NSDraggingSession*, NSDraggingContext) -> NSDragOperation
+        {
+            return NSDragOperationCopy;
+        });
+
+        addMethod (@selector (draggingSession:endedAtPoint:operation:),
+                   [] (id self, SEL, NSDraggingSession*, NSPoint, NSDragOperation)
+        {
+            auto* members = getMembers (self);
+
+            if (members == nullptr)
+                return;
+
+            // The drag session swallowed the mouse up, so the page still thinks the button is down.
+            if (auto* view = members->view.get())
+            {
+                if (auto* window = [view window])
+                {
+                    if (auto* up = [NSEvent mouseEventWithType: NSEventTypeLeftMouseUp
+                                                      location: [window mouseLocationOutsideOfEventStream]
+                                                 modifierFlags: 0
+                                                     timestamp: [[NSProcessInfo processInfo] systemUptime]
+                                                  windowNumber: [window windowNumber]
+                                                       context: nil
+                                                   eventNumber: 0
+                                                    clickCount: 1
+                                                      pressure: 0])
+                    {
+                        [view mouseUp: up];
+                    }
+                }
+            }
+
+            NullCheckedInvocation::invoke (std::exchange (members->onFinished, nullptr));
+        });
+
+        addProtocol (@protocol (NSDraggingSource));
+
+        registerClass();
+    }
+};
+
 template <class WebViewClass>
 struct WebViewKeyEquivalentResponder final : public ObjCClass<WebViewClass>
 {
@@ -186,6 +290,47 @@ struct WebViewKeyEquivalentResponder final : public ObjCClass<WebViewClass>
         : Base ("WebViewKeyEquivalentResponder_")
     {
         this->template addIvar<LastFocusChange*> (lastFocusChangeMemberName);
+
+        if constexpr (std::is_same_v<WebViewClass, WKWebView>)
+        {
+            this->template addIvar<WebViewFileDragState*> (fileDragStateMemberName);
+
+            this->addMethod (@selector (mouseDown:), [] (id self, SEL selector, NSEvent* event)
+            {
+                rememberMouseEvent (self, event);
+                Base::template sendSuperclassMessage<void> (self, selector, event);
+            });
+
+            this->addMethod (@selector (mouseDragged:), [] (id self, SEL selector, NSEvent* event)
+            {
+                rememberMouseEvent (self, event);
+                Base::template sendSuperclassMessage<void> (self, selector, event);
+            });
+
+            // WebKit only calls this when the page accepted the drag in its dragover handler.
+            this->addMethod (@selector (performDragOperation:), [] (id self, SEL selector, id<NSDraggingInfo> info) -> BOOL
+            {
+                const auto result = Base::template sendSuperclassMessage<BOOL> (self, selector, info);
+
+                auto* state = getFileDragStateHandle (self);
+
+                if (state == nullptr || state->onFileDrop == nullptr)
+                    return result;
+
+                NSArray* urls = [[info draggingPasteboard] readObjectsForClasses: @[ [NSURL class] ]
+                                                                        options: @{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }];
+                StringArray paths;
+
+                for (NSURL* url in urls)
+                    paths.add (nsStringToJuce ([url path]));
+
+                // Off the drag callback, so the handler can open windows or reload the page safely.
+                if (! paths.isEmpty())
+                    MessageManager::callAsync ([handler = state->onFileDrop, paths] { handler (paths); });
+
+                return result;
+            });
+        }
 
         this->addMethod (@selector (performKeyEquivalent:),
                          [] (id self, SEL selector, NSEvent* event)
@@ -888,6 +1033,8 @@ public:
                                                       configuration: config.get()]);
 
         setLastFocusChangeHandle (webView.get(), &lastFocusChange);
+        fileDragState.onFileDrop = browserOptions.getFileDropHandler();
+        setFileDragStateHandle (webView.get(), &fileDragState);
        #else
         webView.reset ([[WKWebView alloc] initWithFrame: CGRectMake (0, 0, 100.0f, 100.0f)
                                           configuration: config.get()]);
@@ -906,6 +1053,9 @@ public:
     ~WKWebViewImpl() override
     {
         WebViewDelegateClass::setConnector (webViewDelegate.get(), nullptr);
+       #if JUCE_MAC
+        setFileDragStateHandle (webView.get(), nullptr);
+       #endif
 
         setView (nil);
         [webView.get() setNavigationDelegate: nil];
@@ -1096,11 +1246,46 @@ public:
                                           }];
     }
 
+   #if JUCE_MAC
+    bool startExternalFileDrag (const StringArray& files, std::function<void()> onFinished) override
+    {
+        auto* view = webView.get();
+        auto* event = fileDragState.lastMouseEvent.get();
+
+        // A drag session has to start from the press that is still in progress.
+        if (event == nil || [event window] != [view window] || ([NSEvent pressedMouseButtons] & 1) == 0)
+            return false;
+
+        JUCE_AUTORELEASEPOOL
+        {
+            auto* items = [[[NSMutableArray alloc] init] autorelease];
+            const auto location = [view convertPoint: [event locationInWindow] fromView: nil];
+
+            for (const auto& file : files)
+            {
+                auto* path = juceStringToNS (file);
+                auto* item = [[[NSDraggingItem alloc] initWithPasteboardWriter: [NSURL fileURLWithPath: path]] autorelease];
+                [item setDraggingFrame: NSMakeRect (location.x - 16, location.y - 16, 32, 32)
+                              contents: [[NSWorkspace sharedWorkspace] iconForFile: path]];
+                [items addObject: item];
+            }
+
+            auto* source = WebViewFileDragSource::create ({ ObjCObjectHandle<NSView*> { [view retain] },
+                                                            std::move (onFinished) });
+
+            return [view beginDraggingSessionWithItems: items event: event source: source] != nil;
+        }
+    }
+   #endif
+
 private:
     WebBrowserComponent::Impl& owner;
     DelegateConnector delegateConnector;
     bool allowAccessToEnclosingDirectory = false;
     LastFocusChange lastFocusChange;
+   #if JUCE_MAC
+    WebViewFileDragState fileDragState;
+   #endif
     ObjCObjectHandle<WKWebView*> webView;
     ObjCObjectHandle<id> webViewDelegate;
 };
